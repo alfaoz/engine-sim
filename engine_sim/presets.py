@@ -566,10 +566,107 @@ def _tdi_2000():
     )
 
 
+def _scooter_125():
+    # 125cc 4-stroke scooter single (GY6-ish)
+    return EngineConfig(
+        name="125cc 4-stroke scooter",
+        bore=0.0524, stroke=0.0578, conrod=0.090,
+        compression_ratio=10.5, n_cylinders=1, stroke_cycle=4,
+        ignition_btdc=22.0, burn_duration=54.0,
+        redline_rpm=9000.0, idle_rpm=1700.0, inertia=0.012,
+        pipe_length=0.9, pipe_diameter=0.028, runner_spread=0.0,
+        firing_order=[1],
+    )
+
+
+def _grom_125():
+    # 125cc 4-stroke mini-bike single (Honda Grom-ish, low-revving)
+    return EngineConfig(
+        name="125cc mini-bike single",
+        bore=0.0524, stroke=0.0578, conrod=0.092,
+        compression_ratio=10.0, n_cylinders=1, stroke_cycle=4,
+        ignition_btdc=20.0, burn_duration=56.0,
+        redline_rpm=8500.0, idle_rpm=1500.0, inertia=0.014,
+        pipe_length=1.0, pipe_diameter=0.030, runner_spread=0.0,
+        firing_order=[1],
+    )
+
+
+def _moto_300_twin():
+    # 300cc parallel-twin small bike (180deg crank)
+    return EngineConfig(
+        name="300cc parallel-twin",
+        bore=0.062, stroke=0.0497, conrod=0.090,
+        compression_ratio=11.0, n_cylinders=2, stroke_cycle=4,
+        ignition_btdc=22.0, burn_duration=50.0,
+        redline_rpm=12500.0, idle_rpm=1400.0, inertia=0.018,
+        pipe_length=1.0, pipe_diameter=0.034, runner_spread=0.14,
+        firing_order=[1, 2],
+    )
+
+
+def _moped_50_4t():
+    # 50cc 4-stroke moped single
+    return EngineConfig(
+        name="50cc 4-stroke moped",
+        bore=0.039, stroke=0.0418, conrod=0.070,
+        compression_ratio=11.0, n_cylinders=1, stroke_cycle=4,
+        ignition_btdc=20.0, burn_duration=56.0,
+        redline_rpm=8500.0, idle_rpm=1800.0, inertia=0.006,
+        pipe_length=0.7, pipe_diameter=0.022, runner_spread=0.0,
+        firing_order=[1],
+    )
+
+
+def _kei_660_turbo():
+    # 660cc kei-car inline-3 turbo (Japan kei class)
+    return EngineConfig(
+        name="660cc inline-3 turbo (kei)",
+        bore=0.064, stroke=0.0683, conrod=0.112,
+        compression_ratio=9.2, n_cylinders=3, stroke_cycle=4,
+        diesel=False, turbo_boost=55000.0,
+        ignition_btdc=18.0, burn_duration=52.0,
+        redline_rpm=7000.0, idle_rpm=850.0, inertia=0.10,
+        pipe_length=1.3, pipe_diameter=0.040, runner_spread=0.20,
+        firing_order=[1, 2, 3],
+    )
+
+
+def _kei_660_na():
+    # 660cc kei-car inline-3 NA
+    return EngineConfig(
+        name="660cc inline-3 (kei NA)",
+        bore=0.064, stroke=0.0683, conrod=0.112,
+        compression_ratio=11.2, n_cylinders=3, stroke_cycle=4,
+        ignition_btdc=22.0, burn_duration=52.0,
+        redline_rpm=7200.0, idle_rpm=850.0, inertia=0.10,
+        pipe_length=1.3, pipe_diameter=0.038, runner_spread=0.20,
+        firing_order=[1, 2, 3],
+    )
+
+
+def _citycar_1200():
+    # 1.2L inline-4 economy city-car engine
+    return EngineConfig(
+        name="1.2L inline-4 (city)",
+        bore=0.0710, stroke=0.0758, conrod=0.130,
+        compression_ratio=11.0, n_cylinders=4, stroke_cycle=4,
+        ignition_btdc=20.0, burn_duration=52.0,
+        redline_rpm=6200.0, idle_rpm=780.0, inertia=0.15,
+        pipe_length=1.6, pipe_diameter=0.044, runner_spread=0.22,
+        firing_order=[1, 3, 4, 2],
+    )
+
+
 PRESETS = {
-    # --- motorcycles ---
+    # --- small / mopeds / scooters ---
     "50cc 2-stroke single": _moped_50cc,
+    "50cc 4-stroke moped": _moped_50_4t,
+    "125cc 4-stroke scooter": _scooter_125,
+    "125cc mini-bike single": _grom_125,
     "250cc 2-stroke single": _two_stroke_250,
+    "300cc parallel-twin": _moto_300_twin,
+    # --- motorcycles ---
     "125cc 4-stroke single": _moto_125,
     "650cc thumper single": _thumper_single,
     "689cc parallel-twin (270°)": _parallel_twin_270,
@@ -580,8 +677,11 @@ PRESETS = {
     "600cc inline-4 sportbike": _sportbike_600,
     "998cc cross-plane I4 (R1)": _r1_crossplane,
     "1.1L V4 superbike (Ducati)": _ducati_v4,
-    # --- cars: NA petrol ---
+    # --- cars: small / NA petrol ---
+    "660cc inline-3 (kei NA)": _kei_660_na,
+    "660cc inline-3 turbo (kei)": _kei_660_turbo,
     "1.0L inline-3": _triple_1000,
+    "1.2L inline-4 (city)": _citycar_1200,
     "1.6L inline-4 NA": _na_1600,
     "2.0L flat-4 boxer": _boxer4_na,
     "2.0L VTEC high-rev I4": _vtec_i4,
@@ -630,11 +730,23 @@ VEHICLES = {
     "Moped": VehicleConfig(
         name="Moped", mass=95.0, cd=0.9, frontal_area=0.6, crr=0.020,
         wheel_radius=0.20, final_drive=5.2, gear_ratios=[2.8]),
+    "Pit bike": VehicleConfig(
+        name="Pit bike", mass=85.0, cd=0.7, frontal_area=0.55, crr=0.022,
+        wheel_radius=0.22, final_drive=4.2,
+        gear_ratios=[2.6, 1.8, 1.35, 1.05]),
+    "Small bike (commuter)": VehicleConfig(
+        name="Commuter bike", mass=160.0, cd=0.62, frontal_area=0.58, crr=0.019,
+        wheel_radius=0.28, final_drive=4.8,
+        gear_ratios=[2.7, 1.85, 1.4, 1.15, 0.96, 0.84]),
     "Motorcycle (sport)": VehicleConfig(
         name="Sport bike", mass=240.0, cd=0.58, frontal_area=0.6, crr=0.018,
         # final_drive folds in the primary reduction (~1.9) + chain (~2.9)
         wheel_radius=0.30, final_drive=5.6,
         gear_ratios=[2.62, 1.95, 1.58, 1.36, 1.21, 1.10]),
+    "Microcar": VehicleConfig(
+        name="Microcar", mass=600.0, cd=0.34, frontal_area=1.7, crr=0.013,
+        wheel_radius=0.24, final_drive=4.6,
+        gear_ratios=[3.7, 2.1, 1.4, 1.0, 0.82]),
     "City car": VehicleConfig(
         name="City car", mass=960.0, cd=0.32, frontal_area=2.0, crr=0.012,
         wheel_radius=0.28, final_drive=4.1,
