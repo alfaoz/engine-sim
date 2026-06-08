@@ -12,6 +12,7 @@ from .presets import EngineConfig, VehicleConfig, get_vehicle
 GRAV = 9.81
 RHO_AIR = 1.20
 TWO_PI_60 = 2.0 * math.pi / 60.0   # rpm -> rad/s
+TRACTION_MU = 0.95                 # tire grip limit (drive force <= mu*m*g)
 
 R_AIR = 287.0
 GAMMA_CYL = 1.34
@@ -49,6 +50,9 @@ class EngineSim:
         self.clutch_cap = 200.0
         self.boost = 0.0           # actual turbo boost (Pa), spools with lag
         self.thr_smooth = 0.0      # slewed throttle (intake/fuel dynamics)
+        self.clutch_locked = False # driveline rigidly engaged
+        self.clutch_engage = 0.0   # 0..1 clutch engagement (slipping launch)
+        self.base_inertia = 0.2    # engine-only rotating inertia
 
         self.load_config(cfg)
 
@@ -175,6 +179,9 @@ class EngineSim:
         self.crank_timer = 0.0
         self.boost = 0.0
         self.thr_smooth = 0.0
+        self.clutch_locked = False
+        self.clutch_engage = 0.0
+        self.base_inertia = cfg.inertia
         Vmid = Vclear + 0.5 * Vdisp
         self.cyl_T = np.full(ncyl, TINT)
         self.cyl_m = np.full(ncyl, PATM * Vmid / (R_AIR * TINT))
@@ -232,12 +239,14 @@ class EngineSim:
     def shift_up(self):
         if self.gear < self.vehicle.n_gears():
             self.gear += 1
-            self.shift_timer = 0.15
+            self.shift_timer = 0.12
+            self.clutch_locked = False   # re-engages (clutch_engage preserved)
 
     def shift_down(self):
         if self.gear > 0:
             self.gear -= 1
-            self.shift_timer = 0.15
+            self.shift_timer = 0.12
+            self.clutch_locked = False
 
     def gear_label(self):
         return "N" if self.gear == 0 else str(self.gear)
@@ -294,43 +303,94 @@ class EngineSim:
                                 0.0, 1.0)) * self.backfire
         self.P[core.P_POP] = pop
 
-        # ---- drivetrain: clutch + gearbox ----
+        # ============================================================
+        # DRIVELINE — coupled rotating inertias, not controllers.
+        #   LOCKED : clutch engaged -> engine + vehicle are ONE rigid body.
+        #            Reflect the car's mass into the engine inertia and road
+        #            drag into its load; car speed = engine speed / gearing.
+        #            (acceleration, top speed and engine braking are emergent)
+        #   SLIP   : launch. Real Coulomb friction torque couples the two
+        #            inertias; engine and vehicle integrate separately.
+        #   FREE   : neutral / shifting. Engine spins free; car coasts on drag.
+        # ============================================================
         omega_eng = self.st[1]
+        r_w = veh.wheel_radius
         ratio = 0.0
-        if self.gear >= 1 and self.gear <= veh.n_gears():
+        if 1 <= self.gear <= veh.n_gears():
             ratio = veh.gear_ratios[self.gear - 1] * veh.final_drive
+        has_veh = veh.mass > 5.0
 
-        T_clutch = 0.0
-        if ratio > 0.0 and self.shift_timer <= 0.0 and self.state != "off":
-            omega_wheel_eng = (self.v / veh.wheel_radius) * ratio
+        # road resistance force (N), always opposing forward motion
+        roll = veh.crr * veh.mass * GRAV
+        drag = 0.5 * RHO_AIR * veh.cd * veh.frontal_area * self.v * self.v
+        brake_f = self.brake * veh.mass * 8.0
+        f_resist = roll + drag + brake_f
+
+        # default: engine feels only its own inertia + accessory load
+        inertia = self.base_inertia
+        load_torque = self.load
+
+        if ratio == 0.0 or self.state != "running" or not has_veh:
+            # neutral / off / bench -> driveline open, vehicle coasts
+            self.clutch_locked = False
+            self.clutch_engage = 0.0
+            if has_veh and self.v > 0.01:
+                self.v = max(0.0, self.v - f_resist / veh.mass * dt)
+        elif self.shift_timer > 0.0:
+            # mid-shift: clutch open, vehicle coasts (lock state preserved)
+            if self.v > 0.01:
+                self.v = max(0.0, self.v - f_resist / veh.mass * dt)
+        else:
+            omega_wheel_eng = (self.v / r_w) * ratio
             slip = omega_eng - omega_wheel_eng
-            # Two inertias (engine, vehicle) coupled by a clutch.
-            cap = self.clutch_cap
-            launch_w = (0.50 if cfg.diesel else 0.72) * cfg.redline_rpm * TWO_PI_60
-            launching = self.pedal > 0.1 and omega_wheel_eng < launch_w
 
-            if launching:
-                # Slipping clutch as an engine-speed regulator targeting the
-                # powerband: transmit torque proportional to how far the engine
-                # is ABOVE launch_w (drives the car, drags down any over-rev),
-                # and 0 when below (lets it spin up freely -> can't stall).
-                T_clutch = float(np.clip(cap * (omega_eng - launch_w) / 60.0,
-                                         0.0, cap))
+            # near idle on a closed throttle, slip the clutch (as a driver would
+            # press it in) so engine braking can't drag the engine to a stall
+            if (self.clutch_locked and self.pedal < 0.05
+                    and omega_eng < 1.2 * idle * TWO_PI_60):
+                self.clutch_locked = False
+                self.clutch_engage = 0.0
+
+            if self.clutch_locked:
+                # rigid driveline: engine carries the car's reflected mass and
+                # fights road drag through the gearing; speed is tied to revs.
+                i_refl = veh.mass * (r_w / ratio) ** 2
+                inertia = self.base_inertia + i_refl
+                sgn = 1.0 if self.v > 0.01 else 0.0
+                load_torque += f_resist * (r_w / ratio) * sgn
+                # tire grip: a low gear can demand more drive force than the
+                # tires hold -> cap the car's acceleration at mu*g (wheelspin),
+                # the surplus engine torque is absorbed as slip.
+                fric = self.P[core.P_FRIC0] + self.P[core.P_FRICW] * omega_eng
+                net = self.torque - fric - load_torque
+                a_imp = net / inertia * r_w / ratio
+                if a_imp > TRACTION_MU * GRAV:
+                    load_torque += (a_imp - TRACTION_MU * GRAV) * inertia * ratio / r_w
+                self.v = max(0.0, omega_eng * r_w / ratio)
             else:
-                # Engaged: stiff coupling locks engine to wheels (small slip ->
-                # large torque), giving rigid drive, cruise and engine braking.
-                T_clutch = float(np.clip(cap * math.tanh(slip / 1.0), -cap, cap))
-
-        # ---- vehicle longitudinal dynamics ----
-        if veh.mass > 5.0:
-            drive_force = (T_clutch * ratio / veh.wheel_radius) if ratio > 0 else 0.0
-            roll = veh.crr * veh.mass * GRAV
-            drag = 0.5 * RHO_AIR * veh.cd * veh.frontal_area * self.v * self.v
-            brake_f = self.brake * veh.mass * 9.0       # up to ~0.9 g braking
-            moving = self.v > 0.02
-            resist = (roll + drag + brake_f) if moving else 0.0
-            net_f = drive_force - resist
-            self.v = max(0.0, self.v + net_f / veh.mass * dt)
+                # Slipping clutch (launch / creep). The clamp force is modulated
+                # -- as a driver's clutch foot or a TCU would -- to hold the
+                # engine near a launch speed while feeding its available torque
+                # to the car. This is the ONLY control law; locked driving above
+                # is pure physics. It can't stall: if the engine sags below the
+                # launch speed the transmitted torque backs off automatically.
+                fric = self.P[core.P_FRIC0] + self.P[core.P_FRICW] * omega_eng
+                avail = self.torque - fric              # engine's spare torque
+                target_rpm = idle + self.pedal * (0.45 * cfg.redline_rpm - idle)
+                target_w = target_rpm * TWO_PI_60
+                self.clutch_engage = min(1.0, self.clutch_engage + dt * 6.0)
+                cap = self.clutch_cap
+                T_reg = avail + (cap / 50.0) * (omega_eng - target_w)
+                T_clutch = float(np.clip(T_reg, 0.0, cap)) * self.clutch_engage
+                load_torque += T_clutch                 # reaction on the engine
+                f_drive = T_clutch * ratio / r_w        # drives the car
+                f_drive = min(f_drive, TRACTION_MU * veh.mass * GRAV)  # tire grip
+                sgn = 1.0 if self.v > 0.01 else 0.0
+                accel = (f_drive - f_resist * sgn) / veh.mass
+                self.v = max(0.0, self.v + accel * dt)
+                # lock up once revs match and the clutch is fully out
+                if abs(slip) < 3.0 and self.clutch_engage > 0.95:
+                    self.clutch_locked = True
 
         # ---- intake dynamics: throttle/fuel slew + turbo spool ----
         # the slew models tip-in fuel/intake lag; bypass it at idle so the
@@ -358,7 +418,8 @@ class EngineSim:
         # ---- write into the sim parameter array ----
         self.P[core.P_THROTTLE] = thr
         self._set_map(thr)
-        self.P[core.P_LOAD] = T_clutch + self.load
+        self.P[core.P_LOAD] = load_torque
+        self.P[core.P_INERTIA] = inertia
         self.P[core.P_RUNNING] = running
         self.P[core.P_STARTER] = starter
 

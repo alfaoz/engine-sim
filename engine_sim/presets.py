@@ -371,7 +371,7 @@ VEHICLES = {
         wheel_radius=0.44, final_drive=4.6,
         gear_ratios=[5.5, 3.0, 1.9, 1.3, 1.0, 0.78]),
     "Bus / lorry": VehicleConfig(
-        name="Bus", mass=9000.0, cd=0.60, frontal_area=6.8, crr=0.015,
+        name="Bus", mass=14000.0, cd=0.60, frontal_area=6.8, crr=0.015,
         wheel_radius=0.50, final_drive=4.8,
         gear_ratios=[6.5, 3.7, 2.4, 1.6, 1.1, 0.82]),
 }

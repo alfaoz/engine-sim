@@ -27,7 +27,7 @@ def dyno(name):
         sim.step_block(BLOCK)
 
     # now bolt on a big flywheel and go WOT so the rev-up samples finely
-    sim.P[core.P_INERTIA] = FLYWHEEL
+    sim.base_inertia = FLYWHEEL
     sim.set_throttle(1.0)
 
     Vd = math.pi / 4 * cfg.bore ** 2 * cfg.stroke * cfg.n_cylinders
