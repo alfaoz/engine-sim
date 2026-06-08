@@ -12,7 +12,9 @@ from .presets import EngineConfig, VehicleConfig, get_vehicle
 GRAV = 9.81
 RHO_AIR = 1.20
 TWO_PI_60 = 2.0 * math.pi / 60.0   # rpm -> rad/s
-TRACTION_MU = 0.95                 # tire grip limit (drive force <= mu*m*g)
+TRACTION_MU = 1.00                 # tyre grip limit (drive force <= mu*m*g)
+DRIVELINE_FN = 18.0                # driveline torsional natural freq (Hz)
+DRIVELINE_ZETA = 0.7               # driveline damping ratio
 
 R_AIR = 287.0
 GAMMA_CYL = 1.34
@@ -30,10 +32,13 @@ class EngineSim:
     def __init__(self, cfg: EngineConfig):
         self.lock = threading.Lock()
         self.stream = None
+        self.device = None          # output device index (None = system default)
         self.volume = 0.6
         self.pedal = 0.0            # accelerator pedal 0..1
         self.load = 0.0             # extra accessory load (Nm)
         self.rpm = 0.0
+        self.rpm_prev = 0.0         # previous rpm (idle governor derivative)
+        self.rpm_rate = 0.0         # filtered rpm rate, rpm/s
         self.torque = 0.0
         self.audio_tap = np.zeros(2048, dtype=np.float64)   # ring of last output
         self._tap_pos = 0
@@ -50,9 +55,15 @@ class EngineSim:
         self.clutch_cap = 200.0
         self.boost = 0.0           # actual turbo boost (Pa), spools with lag
         self.thr_smooth = 0.0      # slewed throttle (intake/fuel dynamics)
-        self.clutch_locked = False # driveline rigidly engaged
-        self.clutch_engage = 0.0   # 0..1 clutch engagement (slipping launch)
+        self.clutch_engage = 0.0   # 0..1 automatic-clutch engagement
         self.base_inertia = 0.2    # engine-only rotating inertia
+        # audio source mix (for A/B-ing real vs coloration)
+        # induction OFF by default: the current 1D-duct coupling is a numerical
+        # hack (per-sample impulse into one cell) that buzzes -- it needs a real
+        # airbox + throttled boundary before it earns a place in the mix.
+        self.mix_induction = 0.0
+        self.mix_body = 0.35
+        self.mix_sat = 1.0
 
         self.load_config(cfg)
 
@@ -105,8 +116,19 @@ class EngineSim:
         P[core.P_EVO] = math.radians(cfg.evo)
         P[core.P_EVC] = math.radians(cfg.evc)
         port = cfg.stroke_cycle == 2
-        P[core.P_AIN] = (0.26 if port else 0.16) * Apist
-        P[core.P_AEX] = (0.22 if port else 0.14) * Apist
+        if port:
+            P[core.P_AIN] = 0.26 * Apist
+            P[core.P_AEX] = 0.22 * Apist
+        else:
+            # 4-stroke valve area scaled to the engine's design speed: a
+            # high-revving engine has bigger valves (breathes to its redline),
+            # a low-revving diesel has smaller ones (chokes early). Combined with
+            # valve-area ~ bore^2 vs displacement ~ bore^2*stroke, this makes the
+            # VE roll off -- and therefore peak torque land -- at an engine-
+            # specific rpm instead of the same flat curve for everyone.
+            rev_scale = (cfg.redline_rpm / 6000.0) ** 0.5
+            P[core.P_AIN] = 0.135 * Apist * rev_scale
+            P[core.P_AEX] = 0.135 * Apist * rev_scale
         P[core.P_CD] = 0.70
         P[core.P_INERTIA] = cfg.inertia
         # Friction from FMEP (friction mean effective pressure) x swept volume,
@@ -125,6 +147,29 @@ class EngineSim:
         self.starter_torque = 25.0 + 30.0 * disp_l
         # clutch torque capacity ~ 1.5-2x peak engine torque (disp_l is litres)
         self.clutch_cap = 320.0 * disp_l + 50.0
+
+        # ---- intake manifold (filling/emptying plenum) ----
+        # plenum volume ~ one engine displacement; throttle bore sized so WOT
+        # leaves only a small pumping (manifold) depression near atmospheric.
+        self.man_vol = max(2.0e-4, Vd_total)
+        # full-open throttle flow area, scaled to the engine's intake valve area
+        self.thr_area_max = 0.55 * P[core.P_AIN] * ncyl
+        P[core.P_MANVOL] = self.man_vol
+        P[core.P_TMAN] = TINT
+        P[core.P_PBOOST] = PATM
+        P[core.P_THRAREA] = self.thr_area_max
+        # ---- driveline / vehicle (filled in live each block) ----
+        P[core.P_RATIO] = 0.0
+        P[core.P_RW] = 0.3
+        P[core.P_VMASS] = 0.0
+        P[core.P_CRR] = 0.0
+        P[core.P_CDA] = 0.0
+        P[core.P_BRAKEF] = 0.0
+        P[core.P_TCAP] = 0.0
+        P[core.P_KDL] = 1.0e4
+        P[core.P_CDL] = 50.0
+        P[core.P_MU] = TRACTION_MU
+        P[core.P_GRAVITY] = GRAV
         P[core.P_GAMMAEX] = GAMMA_EX
         P[core.P_REX] = R_AIR
         P[core.P_CVEX] = R_AIR / (GAMMA_EX - 1.0)
@@ -136,6 +181,46 @@ class EngineSim:
         P[core.P_DX] = dx
         P[core.P_PIPELEN] = cfg.pipe_length
         P[core.P_PIPEAREA] = math.pi / 4.0 * cfg.pipe_diameter ** 2
+
+        # 1D intake duct (runner + airbox), coarser grid than exhaust to bound
+        # CPU; 2-strokes use crankcase scavenge, so no duct (Ni=0).
+        if cfg.stroke_cycle == 4:
+            in_len = cfg.intake_length
+            Ni = int(min(160, max(40, in_len / 0.012)))
+            dx_in = in_len / Ni
+            # duct area scales with the engine's intake-valve area (a big engine
+            # has a big intake) so induction gas velocity -- and therefore the
+            # induction sound level -- is roughly engine-size independent.
+            in_area = max(math.pi / 4.0 * cfg.intake_diameter ** 2,
+                          1.8 * P[core.P_AIN] * ncyl)
+        else:
+            Ni, dx_in, in_area, in_len = 0, 1.0, 1.0, 0.0
+        self.Ni = Ni
+        P[core.P_IN_NCELLS] = Ni
+        P[core.P_IN_DX] = dx_in
+        P[core.P_IN_AREA] = in_area
+        P[core.P_INGAIN] = self.mix_induction   # induction mix into the output
+        P[core.P_BODYGAIN] = self.mix_body      # body/thump resonator mix
+        P[core.P_SAT] = self.mix_sat            # tanh saturation on/off
+
+        # ---- turbocharger sizing (boost emerges from the shaft in the core) ----
+        turbo = cfg.turbo_boost > 0.0 and cfg.stroke_cycle == 4
+        P[core.P_TURBO] = 1.0 if turbo else 0.0
+        if turbo:
+            # shaft inertia scales with engine size -> bigger turbos spool slower
+            P[core.P_TRB_INERTIA] = 2.0e-5 + 3.0e-5 * disp_l
+            P[core.P_TRB_RIMP] = 0.026          # compressor impeller radius (m)
+            P[core.P_TRB_ETA] = 0.62 if cfg.diesel else 0.55  # turbine harvest
+            P[core.P_WGATE_PR] = (PATM + cfg.turbo_boost) / PATM
+            P[core.P_ICOOL] = 0.65              # intercooler effectiveness
+            P[core.P_TRB_CELL] = float(int(0.18 * N))   # turbine taps here
+        else:
+            P[core.P_TRB_INERTIA] = 1.0
+            P[core.P_TRB_RIMP] = 0.0
+            P[core.P_TRB_ETA] = 0.0
+            P[core.P_WGATE_PR] = 1.0
+            P[core.P_ICOOL] = 0.0
+            P[core.P_TRB_CELL] = 0.0
         P[core.P_DT] = 1.0 / SAMPLE_RATE
         P[core.P_SR] = SAMPLE_RATE
         P[core.P_HT] = 6.0 * (Apist / 0.005)
@@ -154,12 +239,18 @@ class EngineSim:
         self.P = P
         self.N = N
 
-        # cylinder phase offsets from firing order (even spacing)
-        step = cyc / ncyl
+        # cylinder phase offsets. If the preset gives explicit per-cylinder
+        # firing angles (uneven-firing engines), use them verbatim; otherwise
+        # space the firing order evenly around the cycle.
         phase = np.zeros(ncyl)
-        order = cfg.firing_order if cfg.firing_order else list(range(1, ncyl + 1))
-        for j, cyl in enumerate(order):
-            phase[cyl - 1] = (-j * step) % cyc
+        if cfg.firing_angles and len(cfg.firing_angles) == ncyl:
+            for c in range(ncyl):
+                phase[c] = (-math.radians(cfg.firing_angles[c])) % cyc
+        else:
+            step = cyc / ncyl
+            order = cfg.firing_order if cfg.firing_order else list(range(1, ncyl + 1))
+            for j, cyl in enumerate(order):
+                phase[cyl - 1] = (-j * step) % cyc
         self.phase = phase
 
         # injection cells: spread cylinders over the head end of the pipe
@@ -170,8 +261,10 @@ class EngineSim:
             inj[c] = int(min(0.4, frac) * N)
         self.inj = inj
 
-        # state — engine off (not spinning) until the user cranks it
-        self.st = np.array([0.0, 0.0])
+        # state — engine off (not spinning) until the user cranks it.
+        # st = [crank_angle, omega_eng, vehicle_v, driveline_windup, manifold_mass]
+        self.st = np.zeros(core.S_NSTATE)
+        self.st[core.S_MMAN] = PATM * self.man_vol / (R_AIR * TINT)
         self.state = "off"
         self.v = 0.0
         self.idle_i = 0.0
@@ -179,7 +272,6 @@ class EngineSim:
         self.crank_timer = 0.0
         self.boost = 0.0
         self.thr_smooth = 0.0
-        self.clutch_locked = False
         self.clutch_engage = 0.0
         self.base_inertia = cfg.inertia
         Vmid = Vclear + 0.5 * Vdisp
@@ -191,22 +283,18 @@ class EngineSim:
         self.mom = np.zeros(N)
         self.Ene = np.full(N, PATM / (GAMMA_EX - 1.0))
 
-        self.scope_p = np.full(N_SCOPE, PATM)
-        self.filt = np.zeros(4)     # output filter state (DC block + lowpass)
-        self._set_map(0.0)
+        # 1D intake duct gas state (cool air at rest); min length 1 if disabled
+        nin = max(1, Ni)
+        rho_in0 = PATM / (R_AIR * TINT)
+        self.rho_in = np.full(nin, rho_in0)
+        self.mom_in = np.zeros(nin)
+        self.Ene_in = np.full(nin, PATM / (GAMMA_CYL - 1.0))
 
-    def _set_map(self, thr):
-        # self.boost already holds the (spooled) boost pressure for this block
-        cfg = self.cfg
-        if cfg.diesel:
-            self.P[core.P_MAP] = PATM + self.boost
-        elif cfg.stroke_cycle == 2:
-            # 2-stroke: crankcase delivery is throttle-dependent (instant, no
-            # turbo lag), and tiny at closed throttle so it can idle
-            self.P[core.P_MAP] = PATM * (0.03 + 0.97 * thr) + self.boost
-        else:
-            # low closed-throttle floor; idle governor opens it as needed
-            self.P[core.P_MAP] = PATM * (0.12 + 0.88 * thr) + self.boost
+        self.scope_p = np.full(N_SCOPE, PATM)
+        # output filter state: exhaust DC block (0,1), de-hash LPF (2,3),
+        # body/thump resonator (4,5); induction DC block (6,7), de-hash LPF (8,9)
+        self.filt = np.zeros(12)
+        self.P[core.P_MAP] = PATM
 
     # ------------------------------------------------------------- live tuning
     def set_throttle(self, v):
@@ -239,14 +327,12 @@ class EngineSim:
     def shift_up(self):
         if self.gear < self.vehicle.n_gears():
             self.gear += 1
-            self.shift_timer = 0.12
-            self.clutch_locked = False   # re-engages (clutch_engage preserved)
+            self.shift_timer = 0.12      # clutch declutches for this window
 
     def shift_down(self):
         if self.gear > 0:
             self.gear -= 1
             self.shift_timer = 0.12
-            self.clutch_locked = False
 
     def gear_label(self):
         return "N" if self.gear == 0 else str(self.gear)
@@ -256,172 +342,161 @@ class EngineSim:
 
     # ----------------------------------------------------- control update
     def _control_update(self, dt):
-        """Block-rate engine control + drivetrain + vehicle dynamics.
-        Sets P_THROTTLE / P_LOAD / P_RUNNING / P_STARTER and integrates speed."""
+        """Block-rate DRIVER + ACTUATOR layer only. It sets the inputs the
+        physics core integrates (throttle area, feed pressure, fuelling, gear
+        ratio, clutch capacity, road-load coefficients) and runs the handful of
+        things that genuinely ARE controllers on a real car: the starter, the
+        idle-air governor (the ECU's idle valve), the turbo, and the automatic
+        clutch actuator. All mechanical coupling and vehicle motion is physics,
+        integrated per-sample in the core."""
         cfg = self.cfg
         veh = self.vehicle
         rpm = self.rpm
         idle = cfg.idle_rpm
+        P = self.P
+
+        # filtered rpm rate (rpm/s) for the idle governor's derivative term
+        if dt > 0.0:
+            self.rpm_rate += ((rpm - self.rpm_prev) / dt - self.rpm_rate) * 0.3
+        self.rpm_prev = rpm
 
         if self.shift_timer > 0.0:
             self.shift_timer = max(0.0, self.shift_timer - dt)
 
-        # ---- engine state machine ----
+        # ---- engine state machine + air/fuel demand (0..1) ----
         starter = 0.0
         running = 0.0
-        eff_throttle = 0.0
+        demand = 0.0
         if self.state == "off":
-            pass
+            self.idle_i = 0.0
         elif self.state == "cranking":
             running = 1.0
             starter = self.starter_torque
-            eff_throttle = 0.35
+            demand = 0.25
             self.crank_timer += dt
             if rpm > 0.7 * idle:
                 self.state = "running"
-                self.idle_i = 0.18      # seed so throttle doesn't slam shut
+                self.idle_i = 0.08          # seed near the idle-hold demand
             elif self.crank_timer > 3.0:
-                self.state = "off"     # failed to catch
+                self.state = "off"          # failed to catch
         else:  # running
             running = 1.0
             if self.pedal < 0.03:
-                # fast PI idle governor (must catch decay of a big low-idle V8)
-                err = (idle - rpm) / 1000.0
-                self.idle_i += err * dt * 9.0
-                self.idle_i = float(np.clip(self.idle_i, 0.0, 0.8))
-                eff_throttle = float(np.clip(1.2 * err + self.idle_i, 0.0, 0.85))
+                # idle-air governor: proportional-dominated PI. The rpm plant is
+                # an integrator, so a gentle P term does the regulating and a
+                # slow integral only trims the steady idle-air bias. For petrol
+                # this is the idle-air/throttle area; for diesel it trims fuel.
+                # The PLANT (manifold + combustion) is real physics -- no hacks.
+                # PID idle governor. The plant (manifold->torque->rpm) lags, so
+                # a derivative term on rpm rate damps the overshoot that would
+                # otherwise make a heavy, low-idle engine hunt; the integral
+                # trims the steady idle-air bias.
+                # heavy engines have a much slower rotational plant, so the
+                # integral (which would otherwise wind up and slow-hunt) is eased
+                # off with inertia; P and D stay fixed.
+                ki = 0.40 * float(np.clip((0.2 / max(0.01, cfg.inertia)) ** 0.5,
+                                          0.18, 1.0))
+                err = (idle - rpm) / idle
+                demand = float(np.clip(
+                    self.idle_i + 0.16 * err - 3.0e-5 * self.rpm_rate, 0.0, 0.9))
+                if 0.0 < demand < 0.9:      # integrate only when not saturated
+                    self.idle_i = float(np.clip(self.idle_i + err * dt * ki,
+                                                0.0, 0.7))
             else:
-                eff_throttle = self.pedal
-                self.idle_i = max(self.idle_i * (1.0 - dt), 0.06)  # hold a seed
-            if rpm < 0.22 * idle:
+                demand = self.pedal
+                self.idle_i = float(np.clip(self.idle_i, 0.04, 0.7))
+            if rpm < 0.2 * idle:
                 self.state = "off"          # stalled
 
-        # overrun backfire: closed throttle at elevated rpm (engine braking)
+        # ---- overrun backfire intensity (closed throttle, elevated rpm) ----
         pop = 0.0
         if self.state == "running" and self.pedal < 0.06 and rpm > idle * 1.8:
             pop = float(np.clip((rpm - idle * 1.8) / max(1.0, cfg.redline_rpm),
                                 0.0, 1.0)) * self.backfire
-        self.P[core.P_POP] = pop
+        P[core.P_POP] = pop
 
-        # ============================================================
-        # DRIVELINE — coupled rotating inertias, not controllers.
-        #   LOCKED : clutch engaged -> engine + vehicle are ONE rigid body.
-        #            Reflect the car's mass into the engine inertia and road
-        #            drag into its load; car speed = engine speed / gearing.
-        #            (acceleration, top speed and engine braking are emergent)
-        #   SLIP   : launch. Real Coulomb friction torque couples the two
-        #            inertias; engine and vehicle integrate separately.
-        #   FREE   : neutral / shifting. Engine spins free; car coasts on drag.
-        # ============================================================
-        omega_eng = self.st[1]
+        # ---- intake feed: set throttle area + PRE-compressor feed pressure ----
+        # Turbo boost is no longer scripted here -- it emerges in the core from
+        # the turbo shaft's power balance. We only supply the feed pressure
+        # (atmosphere, or 2-stroke crankcase) and the throttle area.
+        if cfg.diesel:
+            P[core.P_PBOOST] = PATM
+            P[core.P_THRAREA] = self.thr_area_max      # no throttle plate
+            # injection delivery has a little lag of its own
+            self.thr_smooth += (demand - self.thr_smooth) * min(1.0, dt / 0.12)
+            P[core.P_THROTTLE] = self.thr_smooth       # diesel fuelling command
+        elif cfg.stroke_cycle == 2:
+            # 2-stroke crankcase scavenge: throttle-dependent, no turbo shaft
+            P[core.P_PBOOST] = PATM * (0.03 + 0.97 * demand) + cfg.turbo_boost * demand
+            P[core.P_THRAREA] = self.thr_area_max
+            P[core.P_THROTTLE] = demand
+        else:
+            P[core.P_PBOOST] = PATM
+            # progressive throttle plate: area ~ demand^2 gives fine resolution
+            # near idle (gentle loop gain) and full bore at WOT, like a real body
+            P[core.P_THRAREA] = self.thr_area_max * (0.0008 + 0.9992 * demand * demand)
+            P[core.P_THROTTLE] = demand
+
+        # ---- driveline / vehicle inputs for the coupled core integration ----
         r_w = veh.wheel_radius
+        has_veh = veh.mass > 5.0
         ratio = 0.0
         if 1 <= self.gear <= veh.n_gears():
             ratio = veh.gear_ratios[self.gear - 1] * veh.final_drive
-        has_veh = veh.mass > 5.0
 
-        # road resistance force (N), always opposing forward motion
-        roll = veh.crr * veh.mass * GRAV
-        drag = 0.5 * RHO_AIR * veh.cd * veh.frontal_area * self.v * self.v
-        brake_f = self.brake * veh.mass * 8.0
-        f_resist = roll + drag + brake_f
-
-        # default: engine feels only its own inertia + accessory load
-        inertia = self.base_inertia
-        load_torque = self.load
-
-        if ratio == 0.0 or self.state != "running" or not has_veh:
-            # neutral / off / bench -> driveline open, vehicle coasts
-            self.clutch_locked = False
-            self.clutch_engage = 0.0
-            if has_veh and self.v > 0.01:
-                self.v = max(0.0, self.v - f_resist / veh.mass * dt)
-        elif self.shift_timer > 0.0:
-            # mid-shift: clutch open, vehicle coasts (lock state preserved)
-            if self.v > 0.01:
-                self.v = max(0.0, self.v - f_resist / veh.mass * dt)
+        # automatic clutch actuator: how much the clutch is "let out" (0..1).
+        # Disengaged in neutral / shifting / off; locks up once the wheels turn
+        # fast enough; feeds in with throttle for a launch; opens to protect the
+        # engine from stalling. This is the real auto-clutch/TCU, not a physics
+        # fudge -- the torque it then transmits is pure Coulomb friction.
+        idle_w = idle * TWO_PI_60
+        omega_eng = self.st[core.S_OMEGA]
+        omega_in = (self.v / r_w) * ratio if ratio != 0.0 else 0.0
+        rolling = omega_in > 0.9 * idle_w
+        if (ratio == 0.0 or not has_veh or self.state != "running"
+                or self.shift_timer > 0.0):
+            engage_target = 0.0
+        elif rolling:
+            engage_target = 1.0                        # rolling -> lock up
+        elif omega_eng < 0.8 * idle_w:
+            engage_target = 0.0                        # near stall -> slip free
         else:
-            omega_wheel_eng = (self.v / r_w) * ratio
-            slip = omega_eng - omega_wheel_eng
-
-            # near idle on a closed throttle, slip the clutch (as a driver would
-            # press it in) so engine braking can't drag the engine to a stall
-            if (self.clutch_locked and self.pedal < 0.05
-                    and omega_eng < 1.2 * idle * TWO_PI_60):
-                self.clutch_locked = False
-                self.clutch_engage = 0.0
-
-            if self.clutch_locked:
-                # rigid driveline: engine carries the car's reflected mass and
-                # fights road drag through the gearing; speed is tied to revs.
-                i_refl = veh.mass * (r_w / ratio) ** 2
-                inertia = self.base_inertia + i_refl
-                sgn = 1.0 if self.v > 0.01 else 0.0
-                load_torque += f_resist * (r_w / ratio) * sgn
-                # tire grip: a low gear can demand more drive force than the
-                # tires hold -> cap the car's acceleration at mu*g (wheelspin),
-                # the surplus engine torque is absorbed as slip.
-                fric = self.P[core.P_FRIC0] + self.P[core.P_FRICW] * omega_eng
-                net = self.torque - fric - load_torque
-                a_imp = net / inertia * r_w / ratio
-                if a_imp > TRACTION_MU * GRAV:
-                    load_torque += (a_imp - TRACTION_MU * GRAV) * inertia * ratio / r_w
-                self.v = max(0.0, omega_eng * r_w / ratio)
-            else:
-                # Slipping clutch (launch / creep). The clamp force is modulated
-                # -- as a driver's clutch foot or a TCU would -- to hold the
-                # engine near a launch speed while feeding its available torque
-                # to the car. This is the ONLY control law; locked driving above
-                # is pure physics. It can't stall: if the engine sags below the
-                # launch speed the transmitted torque backs off automatically.
-                fric = self.P[core.P_FRIC0] + self.P[core.P_FRICW] * omega_eng
-                avail = self.torque - fric              # engine's spare torque
-                target_rpm = idle + self.pedal * (0.45 * cfg.redline_rpm - idle)
-                target_w = target_rpm * TWO_PI_60
-                self.clutch_engage = min(1.0, self.clutch_engage + dt * 6.0)
-                cap = self.clutch_cap
-                T_reg = avail + (cap / 50.0) * (omega_eng - target_w)
-                T_clutch = float(np.clip(T_reg, 0.0, cap)) * self.clutch_engage
-                load_torque += T_clutch                 # reaction on the engine
-                f_drive = T_clutch * ratio / r_w        # drives the car
-                f_drive = min(f_drive, TRACTION_MU * veh.mass * GRAV)  # tire grip
-                sgn = 1.0 if self.v > 0.01 else 0.0
-                accel = (f_drive - f_resist * sgn) / veh.mass
-                self.v = max(0.0, self.v + accel * dt)
-                # lock up once revs match and the clutch is fully out
-                if abs(slip) < 3.0 and self.clutch_engage > 0.95:
-                    self.clutch_locked = True
-
-        # ---- intake dynamics: throttle/fuel slew + turbo spool ----
-        # the slew models tip-in fuel/intake lag; bypass it at idle so the
-        # governor keeps direct authority (otherwise the two loops hunt/stall)
-        tau_thr = 0.22 if cfg.diesel else 0.05      # diesels ramp fuel lazily
-        if self.pedal < 0.03:
-            self.thr_smooth = eff_throttle
+            engage_target = self.pedal                 # launch: feed with throttle
+        # ease the clutch in slowly for a standstill launch (so the engine revs
+        # up rather than bogging); snap shut quickly once the wheels are rolling
+        if engage_target <= self.clutch_engage:
+            rate = 9.0
+        elif rolling:
+            rate = 9.0
         else:
-            self.thr_smooth += (eff_throttle - self.thr_smooth) * min(1.0, dt / tau_thr)
-        thr = self.thr_smooth
+            rate = 2.2                                  # from-rest launch slip-in
+        self.clutch_engage = float(np.clip(
+            self.clutch_engage + (engage_target - self.clutch_engage)
+            * min(1.0, dt * rate), 0.0, 1.0))
 
-        if cfg.turbo_boost > 0.0 and cfg.stroke_cycle == 4:
-            # turbocharger: boost needs exhaust energy (rpm) and lags (spool)
-            spool = float(np.clip(
-                (rpm - idle) / max(1.0, 0.5 * cfg.redline_rpm - idle), 0.0, 1.0))
-            target = cfg.turbo_boost * thr * spool
-            if target < self.boost:
-                tau = 0.20                          # wastegate/decay is quick
-            else:
-                tau = 0.55 if cfg.diesel else 0.40  # spool-up lag
-            self.boost += (target - self.boost) * min(1.0, dt / tau)
-        else:
-            self.boost = cfg.turbo_boost * thr      # 2-stroke crankcase: instant
+        # torsional driveline stiffness/damping set for a fixed natural
+        # frequency against the gear's reflected inertia (driveline compliance)
+        if ratio != 0.0 and has_veh:
+            i_in = veh.mass * (r_w / ratio) ** 2
+            i_red = 1.0 / (1.0 / self.base_inertia + 1.0 / i_in)
+            wn = 2.0 * math.pi * DRIVELINE_FN
+            P[core.P_KDL] = i_red * wn * wn
+            P[core.P_CDL] = 2.0 * DRIVELINE_ZETA * i_red * wn
 
-        # ---- write into the sim parameter array ----
-        self.P[core.P_THROTTLE] = thr
-        self._set_map(thr)
-        self.P[core.P_LOAD] = load_torque
-        self.P[core.P_INERTIA] = inertia
-        self.P[core.P_RUNNING] = running
-        self.P[core.P_STARTER] = starter
+        P[core.P_RATIO] = ratio
+        P[core.P_RW] = r_w
+        P[core.P_VMASS] = veh.mass
+        P[core.P_CRR] = veh.crr
+        P[core.P_CDA] = 0.5 * RHO_AIR * veh.cd * veh.frontal_area
+        P[core.P_BRAKEF] = self.brake * veh.mass * 8.0
+        P[core.P_TCAP] = self.clutch_cap * self.clutch_engage
+        P[core.P_MU] = TRACTION_MU
+
+        # ---- engine bookkeeping ----
+        P[core.P_LOAD] = self.load
+        P[core.P_INERTIA] = self.base_inertia
+        P[core.P_RUNNING] = running
+        P[core.P_STARTER] = starter
 
     # ------------------------------------------------------------------ stepping
     def step_block(self, n):
@@ -430,9 +505,13 @@ class EngineSim:
             self._control_update(n / SAMPLE_RATE)
             t = simulate_block(n, self.P, self.st, self.cyl_m, self.cyl_T,
                                self.phase, self.inj, self.rho, self.mom,
-                               self.Ene, out, self.scope_p, N_SCOPE, self.filt)
+                               self.Ene, self.rho_in, self.mom_in, self.Ene_in,
+                               out, self.scope_p, N_SCOPE, self.filt)
             self.torque = float(t)
-            self.rpm = self.st[1] * 60.0 / (2.0 * math.pi)
+            self.rpm = self.st[core.S_OMEGA] * 60.0 / (2.0 * math.pi)
+            self.v = float(self.st[core.S_V])
+            self.boost = float(self.P[core.P_BOOSTOUT])      # emergent boost (Pa)
+            self.turbo_rpm = self.st[core.S_TURBO] * 60.0 / (2.0 * math.pi)
         return out
 
     def warmup(self):
@@ -473,8 +552,17 @@ class EngineSim:
             return
         self.stream = sd.OutputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype='float32',
-            blocksize=BLOCK, callback=self._callback)
+            blocksize=BLOCK, device=self.device, callback=self._callback)
         self.stream.start()
+
+    def set_device(self, device):
+        """Select the output device (index or None=default); restart if live."""
+        was_on = self.is_audio_on()
+        if was_on:
+            self.stop_audio()
+        self.device = device
+        if was_on:
+            self.start_audio()
 
     def stop_audio(self):
         if self.stream is not None:
