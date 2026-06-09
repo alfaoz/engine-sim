@@ -151,7 +151,9 @@ P_MUFFLP      = 103 # muffler chamber HF transmission-loss corner (Hz); 0 = off
 
 P_TYRESLIP    = 104 # 1 = slip-ratio tyre + wheel DOF, 0 = rigid grip cap (dyno)
 
-P_NPARAMS     = 105
+P_NBANKS      = 105 # number of separate exhaust banks (V/W engines -> 2+)
+
+P_NPARAMS     = 106
 
 # --- state vector layout (st) ---
 S_THETA       = 0   # crank angle (rad)
@@ -345,7 +347,7 @@ def gas_step(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open, damp,
 
 
 @njit(cache=True, fastmath=True)
-def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
+def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                    rho, mom, Ene, rho_in, mom_in, Ene_in,
                    run_mdot, port_m, fresh, cyl_knk,
                    rho_r, mom_r, Ene_r, src_rm, src_re,
@@ -526,8 +528,14 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
     nsub = int(amax * dt / (0.8 * dx)) + 1
     dt_gas = dt / nsub
 
-    src_m = np.zeros(N)
-    src_E = np.zeros(N)
+    # separate exhaust banks (V/W engines): rho/mom/Ene are (nbanks, N); each
+    # bank is its own collector pipe and radiates from its own tailpipe. The
+    # summed tailpipes give the bank beat / cross-plane rumble of a real V8.
+    nbanks = int(P[P_NBANKS])
+    if nbanks < 1:
+        nbanks = 1
+    src_m = np.zeros((nbanks, N))
+    src_E = np.zeros((nbanks, N))
 
     # intake duct: its own CFL substepping (cooler -> slower sound -> usually
     # fewer substeps than the hot exhaust). Allocate min size 1 when disabled.
@@ -629,9 +637,10 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
         clatter_exc = 0.0       # combustion pressure-rise this sample (Pa), for clatter
         knock_exc = 0.0         # end-gas knock excitation this sample
         air_draw = 0.0          # net intake-valve mass flow this sample (duct src)
-        for k in range(N):
-            src_m[k] = 0.0
-            src_E[k] = 0.0
+        for b in range(nbanks):
+            for k in range(N):
+                src_m[b, k] = 0.0
+                src_E[b, k] = 0.0
         if ram2:
             for c in range(ncyl):
                 src_rm[c, 0] = 0.0      # head-cell source per runner (valve draw)
@@ -866,27 +875,28 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
             fex = open_frac(cph, EVO, EVC, cyc)
             if fex > 0.0:
                 area = Aex * fex
-                # exhaust pipe head cell pressure (where this cyl dumps)
+                # exhaust pipe head cell pressure (in THIS cylinder's bank pipe)
+                cb = cyl_bank[c]
                 ci = inj[c]
-                ui = mom[ci] / rho[ci]
-                Pp = (gex - 1.0) * (Ene[ci] - 0.5 * rho[ci] * ui * ui)
+                ui = mom[cb, ci] / rho[cb, ci]
+                Pp = (gex - 1.0) * (Ene[cb, ci] - 0.5 * rho[cb, ci] * ui * ui)
                 if Pp < 1.0:
                     Pp = 1.0
                 if Pc >= Pp:
                     md = orifice_mdot(Pc, T, Pp, area, Cd, g, R) * dt
                     dm_ex += md
                     dH -= md * cp * T
-                    # deposit into pipe cell
-                    src_m[ci] += md
-                    src_E[ci] += md * cp * T   # stagnation enthalpy in
+                    # deposit into the bank's pipe cell
+                    src_m[cb, ci] += md
+                    src_E[cb, ci] += md * cp * T   # stagnation enthalpy in
                 else:
                     # reversion: pipe gas back into cylinder
-                    Tp = Pp / (rho[ci] * Rex)
+                    Tp = Pp / (rho[cb, ci] * Rex)
                     md = orifice_mdot(Pp, Tp, Pc, area, Cd, gex, Rex) * dt
                     dm_ex -= md
                     dH += md * cp * Tp
-                    src_m[ci] -= md
-                    src_E[ci] -= md * cp * Tp
+                    src_m[cb, ci] -= md
+                    src_E[cb, ci] -= md * cp * Tp
 
                 # ---- overrun backfire (physically gated) ----
                 # When the engine is lean-on-overrun (closed throttle pumping
@@ -895,7 +905,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
                 # fire at most ONCE per exhaust event (this EVO edge), so the
                 # crackle is locked to the firing rate, not the sample rate.
                 if pop > 0.0 and evo_edge and np.random.random() < pop * 0.5:
-                    src_E[ci] += pop_burst * (0.6 + 0.8 * np.random.random())
+                    src_E[cb, ci] += pop_burst * (0.6 + 0.8 * np.random.random())
 
             # ---- update cylinder state (energy & mass balance) ----
             U = m * cv * T
@@ -925,17 +935,24 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
                 scope_p[idx] = Pc
 
         # ---- exhaust gas dynamics substeps (avg tailpipe = anti-alias) ----
+        # Each bank is advanced as its own 1D pipe; the summed tailpipe gauge
+        # pressure across banks IS the voiced signal -- the bank-to-bank cadence
+        # (and cross-plane bank split) gives the V8/W16 rumble.
         Pt_acc = 0.0
         for _ in range(nsub):
-            gas_step(rho, mom, Ene, N, dx, dt_gas, gex, Rex, patm, Tatm,
-                     patm, Tatm, damp, src_m, src_E, cell_vol)
+            for b in range(nbanks):
+                gas_step(rho[b], mom[b], Ene[b], N, dx, dt_gas, gex, Rex,
+                         patm, Tatm, patm, Tatm, damp, src_m[b], src_E[b],
+                         cell_vol)
             # sources are an impulse for the whole sample; apply only once
-            for k in range(N):
-                src_m[k] = 0.0
-                src_E[k] = 0.0
-            ut = mom[N - 1] / rho[N - 1]
-            Pt = (gex - 1.0) * (Ene[N - 1] - 0.5 * rho[N - 1] * ut * ut)
-            Pt_acc += Pt
+            for b in range(nbanks):
+                for k in range(N):
+                    src_m[b, k] = 0.0
+                    src_E[b, k] = 0.0
+            for b in range(nbanks):
+                ut = mom[b, N - 1] / rho[b, N - 1]
+                Pt = (gex - 1.0) * (Ene[b, N - 1] - 0.5 * rho[b, N - 1] * ut * ut)
+                Pt_acc += Pt - patm        # gauge, summed over banks
 
         # ---- per-cylinder 1D intake runners (mode 2): advance each runner with
         # its valve draw as a head-cell source and the mouth open to the plenum
@@ -986,9 +1003,10 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
             air = mdot_thr if mdot_thr > 0.0 else 0.0
             air_ema += (air - air_ema) * 0.02
             # turbine drive from the exhaust thermal/flow state at its cell
-            rt = rho[trb_cell]
-            ut = mom[trb_cell] / rt
-            pt = (gex - 1.0) * (Ene[trb_cell] - 0.5 * rt * ut * ut)
+            # (bank 0; a single turbine fed off one collector is fine here)
+            rt = rho[0, trb_cell]
+            ut = mom[0, trb_cell] / rt
+            pt = (gex - 1.0) * (Ene[0, trb_cell] - 0.5 * rt * ut * ut)
             if pt < 1.0:
                 pt = 1.0
             Tt = pt / (rt * Rex)
@@ -1008,10 +1026,10 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
                 omega_trb = 0.0
             # remove the harvested enthalpy from the pipe (back-pressure), bounded
             ext = P_turb * dt
-            cap = 0.3 * Ene[trb_cell] * cell_vol
+            cap = 0.3 * Ene[0, trb_cell] * cell_vol
             if ext > cap:
                 ext = cap
-            Ene[trb_cell] -= ext / cell_vol
+            Ene[0, trb_cell] -= ext / cell_vol
 
         # ============================================================
         # COUPLED MECHANICS — engine, driveline and vehicle integrated
@@ -1115,8 +1133,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
             theta = _wrap(theta, cyc)
         torque_acc += Tgas_torque
 
-        # ---- audio output: voiced tailpipe gauge pressure ----
-        raw = Pt_acc / nsub - patm
+        # ---- audio output: voiced tailpipe gauge pressure (summed banks) ----
+        raw = Pt_acc / nsub
         # DC blocker (removes the static offset/thump)
         hp = raw - filt[0] + 0.999 * filt[1]
         filt[0] = raw

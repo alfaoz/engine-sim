@@ -81,6 +81,7 @@ class EngineUI:
             runner_spread=g("spread"),
             intake_length=g("intlen"), intake_diameter=g("intdia") / 1000.0,
             muffler_volume=g("muffvol") / 1000.0,
+            exhaust_banks=int(g("ebanks")),
             firing_order=self.sim.cfg.firing_order,
             firing_angles=self.sim.cfg.firing_angles,
         )
@@ -111,6 +112,7 @@ class EngineUI:
             dpg.set_value("intlen", cfg.intake_length)
             dpg.set_value("intdia", cfg.intake_diameter * 1000.0)
             dpg.set_value("ptune", cfg.power_tune)
+            dpg.set_value("ebanks", cfg.exhaust_banks)
         self._building = False
         self._is_custom = cfg.name in self.custom_engines
         if dpg.does_item_exist("custom_lbl"):
@@ -306,7 +308,8 @@ class EngineUI:
         self.sim.P[core.P_IGN] = math.radians(cyc_deg - dpg.get_value("ign"))
         self.sim.P[core.P_BURN] = math.radians(dpg.get_value("burn"))
         self.sim.P[core.P_REDLINE] = dpg.get_value("redline")
-        self.sim.P[core.P_OUTGAIN] = 1.0 / dpg.get_value("outscale")
+        self.sim.P[core.P_OUTGAIN] = (1.0 / dpg.get_value("outscale")
+                                      * getattr(self.sim, "bank_trim", 1.0))
         self.sim.P[core.P_DAMP] = dpg.get_value("damp")
         self._mark_custom()
 
@@ -817,6 +820,11 @@ class EngineUI:
                     self._num("intlen", "Intake length (m)", 0.45, 0.1, 1.0)
                     self._num("intdia", "Intake dia (mm)", 55, 20, 110)
                     self._num("ptune", "Power tune (x)", 1.0, 0.5, 1.6)
+                    dpg.add_input_int(tag="ebanks", label="Exhaust banks (0=auto)",
+                                      default_value=0, min_value=0, max_value=4,
+                                      width=120, callback=self.on_geometry_edit)
+                    dpg.add_text("V/flat=2, W=4 -> bank rumble", color=(140, 140, 140),
+                                 wrap=270)
                     dpg.add_separator()
                     dpg.add_text("VEHICLE", color=(200, 220, 200))
                     dpg.add_text("--", tag="veh_info", color=(180, 180, 180),
@@ -894,7 +902,7 @@ class EngineUI:
         # exhaust gas temp from the hot cells near the head
         N = sim.N
         k0, k1 = max(1, N // 20), max(2, N // 6)
-        rho = sim.rho[k0:k1]; mom = sim.mom[k0:k1]; Ene = sim.Ene[k0:k1]
+        rho = sim.rho[0, k0:k1]; mom = sim.mom[0, k0:k1]; Ene = sim.Ene[0, k0:k1]
         with np.errstate(all='ignore'):
             u = mom / rho
             p = (GEX - 1.0) * (Ene - 0.5 * rho * u * u)
@@ -931,7 +939,7 @@ class EngineUI:
 
         # exhaust pipe pressure profile (the wave)
         N = sim.N
-        rho = sim.rho[:N]; mom = sim.mom[:N]; Ene = sim.Ene[:N]
+        rho = sim.rho[0, :N]; mom = sim.mom[0, :N]; Ene = sim.Ene[0, :N]
         with np.errstate(all='ignore'):
             u = mom / rho
             p = (GEX - 1.0) * (Ene - 0.5 * rho * u * u)

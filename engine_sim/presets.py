@@ -63,6 +63,10 @@ class EngineConfig:
     # muffler chamber volume (m^3); 0 => auto from displacement, <0 => straight
     # pipe / open exhaust (no silencer -> raw, loud, bright)
     muffler_volume: float = 0.0
+    # number of separate exhaust banks: 0 = auto (infer from the name: V/flat=2,
+    # W=4, else inline=1), 1 = forced single collector, 2 = V/flat (left+right
+    # heard separately -> bank beat / cross-plane rumble), 4 = W.
+    exhaust_banks: int = 0
 
     # intake tract (runner + airbox) for the 1D induction-acoustics duct
     intake_length: float = 0.45     # m, port -> airbox mouth

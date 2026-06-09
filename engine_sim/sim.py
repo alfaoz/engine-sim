@@ -236,12 +236,27 @@ class EngineSim:
         P[core.P_REX] = R_AIR
         P[core.P_CVEX] = R_AIR / (GAMMA_EX - 1.0)
 
-        # exhaust grid. Many-cylinder engines get a coarser grid so they stay
-        # real-time (the 16-cyl ones were heavy enough to underrun on slower
-        # machines -> glitchy "buzzing/cutting"); they're heavily muffled so the
-        # lost HF detail is inaudible.
-        cell_sz = 0.013 if ncyl >= 14 else 0.008
-        N = int(min(320, max(90, cfg.pipe_length / cell_sz)))
+        # ---- exhaust bank count (decided here so the grid can be sized for it) ----
+        nbanks = int(cfg.exhaust_banks)
+        if nbanks < 1:
+            nm = cfg.name.lower()
+            if "w16" in nm or "w12" in nm:
+                nbanks = 4
+            elif any(k in nm for k in ("v4", "v6", "v8", "v10", "v12", "v16",
+                                       "v-twin", "l-twin", "flat", "boxer")):
+                nbanks = 2
+            else:
+                nbanks = 1
+        nbanks = max(1, min(nbanks, ncyl))
+        self.nbanks = nbanks
+        P[core.P_NBANKS] = float(nbanks)
+
+        # exhaust grid. Each bank runs its OWN 1D solver, so to stay real-time we
+        # split a fixed total cell budget across the banks (a 2-bank V8 uses ~half
+        # the cells per pipe). Total work then stays ~that of a single pipe, which
+        # is what keeps multi-bank engines from underrunning ("periodic cutout").
+        base_cells = min(320, max(90, cfg.pipe_length / 0.008))
+        N = int(np.clip(base_cells / nbanks, 60, 320))
         dx = cfg.pipe_length / N
         P[core.P_NCELLS] = N
         P[core.P_DX] = dx
@@ -375,6 +390,16 @@ class EngineSim:
         P[core.P_DIFF] = 0.0
         P[core.P_TYRESLIP] = 1.0 if self.tyre_slip else 0.0
 
+        # ---- exhaust banks: assign cylinders (count decided up by the grid) ----
+        # split cylinders 1..n evenly across banks (1-4 left, 5-8 right, ...)
+        cyl_bank = np.zeros(ncyl, dtype=np.int64)
+        for c in range(ncyl):
+            cyl_bank[c] = min(nbanks - 1, c * nbanks // ncyl)
+        self.cyl_bank = cyl_bank
+        # summing banks adds level; trim output gain so V/W engines don't clip
+        self.bank_trim = 1.0 / (1.0 + 0.5 * (nbanks - 1))
+        P[core.P_OUTGAIN] = (1.0 / 2600.0) * self.bank_trim
+
         self.P = P
         self.N = N
 
@@ -392,12 +417,19 @@ class EngineSim:
                 phase[cyl - 1] = (-j * step) % cyc
         self.phase = phase
 
-        # injection cells: spread cylinders over the head end of the pipe
+        # injection cells: spread each bank's cylinders over the head end of
+        # THAT bank's pipe
         inj = np.zeros(ncyl, dtype=np.int64)
         spread = cfg.runner_spread
+        per_bank = [0] * nbanks
         for c in range(ncyl):
-            frac = 0.0 if ncyl == 1 else (c / (ncyl - 1)) * spread
+            per_bank[cyl_bank[c]] += 1
+        seen = [0] * nbanks
+        for c in range(ncyl):
+            b = cyl_bank[c]; cnt = per_bank[b]
+            frac = 0.0 if cnt <= 1 else (seen[b] / (cnt - 1)) * spread
             inj[c] = int(min(0.4, frac) * N)
+            seen[b] += 1
         self.inj = inj
 
         # state — engine off (not spinning) until the user cranks it.
@@ -422,9 +454,9 @@ class EngineSim:
         self.cyl_knk = np.zeros((ncyl, 4))
 
         rho0 = PATM / (R_AIR * TATM)
-        self.rho = np.full(N, rho0)
-        self.mom = np.zeros(N)
-        self.Ene = np.full(N, PATM / (GAMMA_EX - 1.0))
+        self.rho = np.full((nbanks, N), rho0)
+        self.mom = np.zeros((nbanks, N))
+        self.Ene = np.full((nbanks, N), PATM / (GAMMA_EX - 1.0))
 
         # 1D intake duct gas state (cool air at rest); min length 1 if disabled
         nin = max(1, Ni)
@@ -779,7 +811,8 @@ class EngineSim:
         with self.lock:
             self._control_update(n / SAMPLE_RATE)
             t = simulate_block(n, self.P, self.st, self.cyl_m, self.cyl_T,
-                               self.phase, self.inj, self.rho, self.mom,
+                               self.phase, self.inj, self.cyl_bank,
+                               self.rho, self.mom,
                                self.Ene, self.rho_in, self.mom_in, self.Ene_in,
                                self.run_mdot, self.port_m, self.fresh, self.cyl_knk,
                                self.rho_r, self.mom_r, self.Ene_r,
