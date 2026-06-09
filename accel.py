@@ -11,6 +11,7 @@ DT = BLOCK / SAMPLE_RATE
 def accel_test(engine, vehicle, target_kmh=100.0, auto_shift=True):
     sim = EngineSim(get_preset(engine))
     sim.step_block(64); sim.load_config(get_preset(engine))
+    sim.prewarm()
     sim.set_vehicle(get_vehicle(vehicle))
     sim.start_engine()
     for _ in range(40):

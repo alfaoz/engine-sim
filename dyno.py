@@ -16,6 +16,7 @@ def dyno(name):
     cfg = get_preset(name)
     sim = EngineSim(cfg)
     sim.step_block(64); sim.load_config(cfg)
+    sim.prewarm()      # measure WARM performance
 
     # crank it properly so combustion is established (the path that works)
     sim.start_engine()

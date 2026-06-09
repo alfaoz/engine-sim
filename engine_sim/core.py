@@ -115,17 +115,57 @@ P_BOOSTOUT    = 79  # (out) actual boost pressure (Pa, gauge) for the UI
 P_BODYGAIN    = 80  # body/thump resonator mix (0 = off)
 P_SAT         = 81  # 1 = tanh saturation, 0 = hard clip only
 
-P_NPARAMS     = 84
+# --- per-cylinder intake runner (inertia ram tuning) ---
+P_RUN_LEN     = 82  # runner length (m); 0 = ram model off (breathe from MAP)
+P_RUN_AREA    = 83  # runner cross-sectional area (m^2)
+P_RAM_MODE    = 84  # 0 = off (MAP), 1 = lumped column, 2 = 1D wave runners
+P_RUN_NCELLS  = 85  # per-cylinder 1D runner cell count (mode 2)
+P_QWALL       = 86  # (out) combustion heat rejected to the walls this block (J)
+
+# --- fuelling / ignition / mechanical-noise (Phase 1 realism) ---
+P_FUELCUT     = 87  # 1 = injection cut (DFCO / overrun), combustion disabled
+P_PHI         = 88  # commanded fuel/air equivalence ratio (petrol fuelling)
+P_CLATTER     = 89  # mechanical combustion-clatter mix (diesel knock, etc.)
+
+# --- knock / combustion (Phase 2) ---
+P_KNOCK       = 90  # (out) knock intensity accumulated this block
+P_OCTANE      = 91  # fuel octane (RON) for the end-gas autoignition model
+P_KNOCKAUD    = 92  # knock "ping" audio mix level
+
+# --- vehicle: load transfer + road (Phase 2) + tyre slip (Phase 3) ---
+P_GRADE       = 93  # road gradient angle (rad); + = uphill
+P_WD_DRIVE    = 94  # static fraction of weight on the driven axle
+P_XFER        = 95  # longitudinal load-transfer factor h/L (+RWD, -FWD, 0 AWD)
+P_JWHEEL      = 96  # driven wheel + driveline rotational inertia (kg m^2)
+
+# --- lateral dynamics (Phase 4) ---
+P_STEER       = 97  # front road-wheel steer angle (rad)
+P_WHEELBASE   = 98  # wheelbase (m)
+P_WD_FRONT    = 99  # static front weight fraction
+P_CGH         = 100 # CG height (m)
+P_DIFF        = 101 # 0 = open diff, 1 = fully locked (LSD bias in between)
+
+# --- exhaust muffler (geometry-derived lumped acoustics) ---
+P_BODYFREQ    = 102 # exhaust-system body/Helmholtz resonance (Hz)
+P_MUFFLP      = 103 # muffler chamber HF transmission-loss corner (Hz); 0 = off
+
+P_TYRESLIP    = 104 # 1 = slip-ratio tyre + wheel DOF, 0 = rigid grip cap (dyno)
+
+P_NPARAMS     = 105
 
 # --- state vector layout (st) ---
 S_THETA       = 0   # crank angle (rad)
 S_OMEGA       = 1   # engine angular velocity (rad/s)
-S_V           = 2   # vehicle speed (m/s)
+S_V           = 2   # vehicle speed (longitudinal, m/s)
 S_PHI         = 3   # driveline torsional wind-up angle (rad)
 S_MMAN        = 4   # intake manifold trapped gas mass (kg)
 S_TURBO       = 5   # turbo shaft angular velocity (rad/s)
 S_AIRFLOW     = 6   # low-passed engine air mass flow (kg/s) for the turbo
-S_NSTATE      = 7
+S_OMEGA_W     = 7   # driven-wheel angular velocity (rad/s) [tyre slip DOF]
+S_VY          = 8   # lateral (body-frame) velocity (m/s) [lateral dynamics]
+S_YAW         = 9   # yaw rate (rad/s) [lateral dynamics]
+S_HEADING     = 10  # heading angle (rad) [lateral dynamics]
+S_NSTATE      = 11
 
 TWO_PI = 2.0 * np.pi
 
@@ -166,6 +206,14 @@ def open_frac(cp, op, cl, cyc):
     if x > span or span <= 0.0:
         return 0.0
     return np.sin(np.pi * x / span)
+
+
+@njit(cache=True, fastmath=True, inline='always')
+def tyre_mf(s, B, C):
+    """Normalised Pacejka 'magic formula' shape (peak 1.0): force factor vs slip.
+    Rises with slip to a peak then falls -- gives real wheelspin/lockup and the
+    cornering grip limit. s is slip ratio (longitudinal) or slip angle (lateral)."""
+    return np.sin(C * np.arctan(B * s))
 
 
 @njit(cache=True, fastmath=True, inline='always')
@@ -299,11 +347,20 @@ def gas_step(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open, damp,
 @njit(cache=True, fastmath=True)
 def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
                    rho, mom, Ene, rho_in, mom_in, Ene_in,
+                   run_mdot, port_m, fresh, cyl_knk,
+                   rho_r, mom_r, Ene_r, src_rm, src_re,
                    out_audio, scope_p, n_scope, filt):
     """Advance the full engine by n_samples audio samples. Fills out_audio with
     the voiced tailpipe (exhaust) signal plus the intake-mouth induction signal,
     and records cylinder-0 pressure vs crank into scope_p for the UI. Returns
-    mean engine torque. rho_in/mom_in/Ene_in are the 1D intake-duct gas state."""
+    mean engine torque. rho_in/mom_in/Ene_in are the 1D intake-duct gas state.
+
+    Per-cylinder intake-runner ram (inertia tuning):
+      run_mdot[c] : mass flow in cylinder c's intake runner (kg/s), a momentum
+                    state -- the air column's inertia is what rams charge in.
+      port_m[c]   : gas mass in the runner port volume (kg) feeding the valve.
+      fresh[c]    : fresh air mass inducted this cycle (kg); meters the fuel so
+                    the ram VE gain actually shows up as torque."""
     ncyl = int(P[P_NCYL])
     cyc = P[P_CYCLE]
     r = P[P_R]; L = P[P_L]; Apist = P[P_APIST]; Vclear = P[P_VCLEAR]
@@ -332,6 +389,16 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
     crr = P[P_CRR]; cda = P[P_CDA]; brakef = P[P_BRAKEF]
     Tcap = P[P_TCAP]; kdl = P[P_KDL]; cdl = P[P_CDL]
     mu = P[P_MU]; grav = P[P_GRAVITY]
+    grade = P[P_GRADE]                       # road gradient (rad)
+    wd_drive = P[P_WD_DRIVE]                 # static weight frac on driven axle
+    xfer = P[P_XFER]                         # longitudinal load-transfer h/L
+    j_wheel = P[P_JWHEEL]                    # driven-wheel rotational inertia
+    if j_wheel < 1e-3:
+        j_wheel = 1.5
+    tyre_slip = P[P_TYRESLIP] > 0.5          # 0 = rigid grip cap (dyno feel)
+    # lateral / chassis
+    steer = P[P_STEER]; wheelbase = P[P_WHEELBASE]
+    wd_front = P[P_WD_FRONT]; cgh = P[P_CGH]; diff_lock = P[P_DIFF]
     has_veh = vmass > 5.0
     coupled = has_veh and ratio != 0.0 and Tcap > 0.0
     gex = P[P_GAMMAEX]; Rex = P[P_REX]; cvex = P[P_CVEX]
@@ -339,6 +406,37 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
     # 1D intake duct
     Ni = int(P[P_IN_NCELLS]); dx_in = P[P_IN_DX]
     in_area = P[P_IN_AREA]; ingain = P[P_INGAIN]
+    # per-cylinder intake runner (inertia ram), DIRECT-COLUMN model. Geometry
+    # only -- no tuning: the runner air slug (length L_eff = runner length +
+    # textbook 0.85*R open-end correction, area = runner area) has momentum.
+    # d(mdot)/dt = (A/L_eff)*(P_plenum - P_cyl - dP_valve). The column's inertia
+    # is what keeps packing charge toward IVC (ram); the valve is the only
+    # restriction. There is NO buffer-volume constant to fit.
+    run_len = P[P_RUN_LEN]; run_area = P[P_RUN_AREA]
+    ram_mode = int(P[P_RAM_MODE])
+    ram1 = ram_mode == 1 and run_area > 0.0 and four_stroke   # lumped column
+    ram2 = ram_mode == 2 and run_area > 0.0 and four_stroke   # 1D wave runners
+    ram_on = ram1 or ram2
+    if ram1:
+        run_leff = run_len + 0.85 * np.sqrt(run_area / np.pi)
+        inert_k = run_area / run_leff        # inertance coupling (kg/s per Pa.s)
+        ram_amin = 0.02 * Ain                # below this valve area, column halts
+        col_mmax = 500.0 * run_area          # column speed cap (m/s) * area
+    else:
+        run_leff = 1.0; inert_k = 0.0; ram_amin = 0.0; col_mmax = 0.0
+    # mode 2: per-cylinder 1D Euler runner. Each cylinder breathes from its OWN
+    # runner head cell (which carries that runner's pressure wave); the runner
+    # mouth (tail cell) is open to the plenum at MAP. The ram peak rpm and its
+    # strength emerge purely from wave-speed x runner-length -- no fitted const.
+    Nr = int(P[P_RUN_NCELLS])
+    if ram2 and Nr > 1:
+        dx_r = run_len / Nr
+        cell_vol_r = dx_r * run_area
+        amax_r = 480.0                       # cool-intake sound-speed headroom
+        nsub_r = int(amax_r * dt / (0.8 * dx_r)) + 1
+        dt_gas_r = dt / nsub_r
+    else:
+        ram2 = False; dx_r = 1.0; cell_vol_r = 1.0; nsub_r = 1; dt_gas_r = dt
     # turbocharger
     turbo = P[P_TURBO] > 0.5
     J_trb = P[P_TRB_INERTIA]; r_imp = P[P_TRB_RIMP]
@@ -354,6 +452,21 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
     lpf = P[P_LPF]
     noise = P[P_NOISE]
     pop = P[P_POP]
+    fuelcut = P[P_FUELCUT] > 0.5     # DFCO / overrun injection cut
+    phi_cmd = P[P_PHI]               # commanded equivalence ratio (petrol)
+    if phi_cmd <= 0.0:
+        phi_cmd = 1.0
+    clatter_mix = P[P_CLATTER]       # mechanical combustion-clatter level
+    octane = P[P_OCTANE]             # fuel RON for the knock model
+    if octane < 1.0:
+        octane = 95.0
+    knock_aud = P[P_KNOCKAUD]        # knock "ping" audio mix
+    knock_acc = 0.0                  # knock intensity reported to the ECU
+    # end-gas margin: the unburned zone runs cooler than the mean charge temp
+    # (wall heat loss, turbulence) so raw mean-T autoignition over-predicts. This
+    # scale lifts the delay so pump-fuel engines sit just below knock at design
+    # load and only detonate when lugged, over-boosted, or fed low octane.
+    knock_scale = 4.0
     pipe_area = P[P_PIPEAREA]
     cell_vol = dx * pipe_area
     # energy per overrun re-ignition event, scaled to ONE cell's volume so the
@@ -370,10 +483,38 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
     sr = P[P_SR]
     f_main = 2.0 * np.sin(np.pi * 5200.0 / sr)   # de-hash LPF corner
     d_main = 1.25                                # ~Butterworth damping
-    f_body = 2.0 * np.sin(np.pi * 95.0 / sr)     # body/thump resonance
+    # body/Helmholtz resonance: frequency comes from the real muffler chamber
+    # geometry (set in _build), not an arbitrary constant.
+    body_hz = P[P_BODYFREQ]
+    if body_hz < 20.0:
+        body_hz = 95.0
+    f_body = 2.0 * np.sin(np.pi * body_hz / sr)
     d_body = 0.22                                # high-Q -> resonant body
+    # muffler chamber high-frequency transmission loss (one-pole LP); the corner
+    # drops as the chamber grows, so a big silencer is darker than a sports can.
+    muff_hz = P[P_MUFFLP]
+    muff_lp = 0.0
+    if muff_hz > 0.0:
+        muff_lp = 1.0 - np.exp(-2.0 * np.pi * muff_hz / sr)
     body_gain = P[P_BODYGAIN]
     sat_on = P[P_SAT] > 0.5
+    # mechanical combustion-clatter resonators: the combustion pressure-rise
+    # rings the block/head structure. The resonance is now tied to engine size
+    # (a small stiff bike block rings higher, a big diesel lower) instead of a
+    # fixed pitch, and the resonators decay faster (lower Q) so the knocks stay
+    # DISCRETE even at a fast petrol firing rate instead of smearing into a buzz.
+    bore_m = np.sqrt(4.0 * Apist / np.pi)
+    clatter_hz = 145.0 / bore_m
+    if clatter_hz < 850.0:
+        clatter_hz = 850.0
+    elif clatter_hz > 2500.0:
+        clatter_hz = 2500.0
+    f_clk1 = 2.0 * np.sin(np.pi * clatter_hz / sr); d_clk1 = 0.30
+    f_clk2 = 2.0 * np.sin(np.pi * 1.9 * clatter_hz / sr); d_clk2 = 0.38
+    # spark-knock "ping": the end-gas detonation rings the chamber. Lower and
+    # softer than before (~4.5 kHz, lower Q) so it reads as a rattle, not a
+    # harsh digital sine.
+    f_knk = 2.0 * np.sin(np.pi * 4500.0 / sr); d_knk = 0.30
     f_in = 2.0 * np.sin(np.pi * 3600.0 / sr)     # induction de-hash LPF corner
     # the intake duct gets moderate damping (airbox absorption) to tame the
     # high-order organ-pipe modes while keeping the low induction honk.
@@ -403,6 +544,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
 
     torque_acc = 0.0
     map_acc = 0.0
+    qwall_acc = 0.0      # combustion heat rejected to the walls this block (J)
     scope_period = cyc  # one full cycle for cylinder 0
 
     theta = st[S_THETA]
@@ -412,6 +554,29 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
     m_man = st[S_MMAN]
     omega_trb = st[S_TURBO]
     air_ema = st[S_AIRFLOW]
+    omega_w = st[S_OMEGA_W]      # driven-wheel speed (tyre slip DOF)
+    vy = st[S_VY]                # lateral velocity (bicycle model)
+    yaw = st[S_YAW]             # yaw rate
+    heading = st[S_HEADING]
+
+    # ---- vehicle / tyre constants (precomputed) ----
+    v_eps = 2.5                  # slip-ratio low-speed regulariser (m/s)
+    B_long = 10.0; C_long = 1.6  # longitudinal tyre magic-formula shape
+    B_lat = 8.0; C_lat = 1.5     # lateral (cornering) tyre shape
+    cos_grade = np.cos(grade); sin_grade = np.sin(grade)
+    g_eff = grav * cos_grade     # normal-load gravity component on a slope
+    awd = wd_drive > 0.95        # all-wheel drive (split torque both axles)
+    rear_driven = xfer >= 0.0    # RWD: accel transfers load ONTO the driven axle
+    lateral_on = wheelbase > 0.5 and has_veh
+    if lateral_on:
+        a_cg = (1.0 - wd_front) * wheelbase   # CG -> front axle
+        b_cg = wd_front * wheelbase           # CG -> rear axle
+        Iz = vmass * a_cg * b_cg              # yaw inertia (radius_gyr^2 = a*b)
+        if Iz < 1.0:
+            Iz = 1.0
+    else:
+        a_cg = 1.0; b_cg = 1.0; Iz = 1.0
+    ax_long = 0.0                # longitudinal accel (lagged, for load transfer)
 
     # turbomachinery constants
     cp_ex = cvex + Rex
@@ -461,10 +626,16 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
 
         # per-cylinder thermodynamics over this sample
         Tgas_torque = 0.0
+        clatter_exc = 0.0       # combustion pressure-rise this sample (Pa), for clatter
+        knock_exc = 0.0         # end-gas knock excitation this sample
         air_draw = 0.0          # net intake-valve mass flow this sample (duct src)
         for k in range(N):
             src_m[k] = 0.0
             src_E[k] = 0.0
+        if ram2:
+            for c in range(ncyl):
+                src_rm[c, 0] = 0.0      # head-cell source per runner (valve draw)
+                src_re[c, 0] = 0.0
 
         for c in range(ncyl):
             cph = _wrap(theta + phase[c], cyc)        # cycle phase
@@ -487,7 +658,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
                 f_pre += cyc / burn
             dxb = wiebe(f_now, wa, wm) - wiebe(f_pre, wa, wm)
             rpm_now = omega * 9.5492966   # 60/(2pi)
-            if dxb > 0.0 and rpm_now < redline and running:
+            if dxb > 0.0 and rpm_now < redline and running and not fuelcut:
                 # fuel energy available this cycle (mass trapped is ~constant now)
                 if diesel:
                     # fuel metered by throttle, capped by the smoke limit (a
@@ -495,29 +666,177 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
                     air = m
                     fuel_max = air / 23.0
                     fuel = throttle * fuel_max
+                    Qcyc = fuel * LHV * ceff
                 else:
-                    # meter fuel by FRESH air delivered (~ manifold pressure), not
-                    # total trapped mass — trapped exhaust residual carries no O2.
-                    # This is what lets a 2-stroke idle instead of self-charging.
-                    fresh = MAP * Vdisp / (R * Tman)
-                    air = m if m < fresh else fresh
-                    fuel = air / AFR
-                Qcyc = fuel * LHV * ceff
+                    if ram_on:
+                        # meter by the fresh air the runner ACTUALLY inducted this
+                        # cycle -- so the inertia-ram VE gain shows up as torque.
+                        air = fresh[c]
+                        if air < 0.0:
+                            air = 0.0
+                        if air > m:
+                            air = m
+                    else:
+                        # no runner model: estimate fresh charge from manifold
+                        # pressure (trapped residual carries no O2). Lets 2T idle.
+                        fr = MAP * Vdisp / (R * Tman)
+                        air = m if m < fr else fr
+                    # equivalence-ratio fuelling. AFR is stoichiometric; phi_cmd is
+                    # the ECU's commanded richness. Beyond stoich (phi>1) the extra
+                    # fuel finds no O2 so the released energy is capped (burn_phi);
+                    # a small completeness bump peaks just rich of stoich (why peak
+                    # power is made ~12.5:1), and a lean charge burns less and
+                    # eventually misfires. At phi=1 comp=1 so the WOT calibration
+                    # (stoich) is preserved exactly.
+                    stoich_fuel = air / AFR
+                    burn_phi = phi_cmd if phi_cmd < 1.0 else 1.0
+                    if phi_cmd <= 1.0:
+                        comp = 1.0 - 0.8 * (1.0 - phi_cmd) * (1.0 - phi_cmd)
+                        if phi_cmd < 0.6:
+                            comp *= phi_cmd / 0.6      # very lean -> misfire toward 0
+                    else:
+                        d = phi_cmd - 1.0
+                        comp = 1.0 + 0.5 * d - 2.2 * d * d
+                    if comp < 0.0:
+                        comp = 0.0
+                    Qcyc = stoich_fuel * burn_phi * LHV * ceff * comp
                 # cycle/flame roughness so cycles aren't mathematically identical
                 rough = 1.0 + noise * np.random.standard_normal()
                 if rough < 0.0:
                     rough = 0.0
-                dQ += Qcyc * dxb * rough
+                dq_fuel = Qcyc * dxb * rough
+                dQ += dq_fuel
+                # combustion-clatter excitation: the heat-release pressure rise
+                # (g-1)*dQ/V is what rings the structure (sharp for diesel CI).
+                clatter_exc += (g - 1.0) * dq_fuel / V
+
+            # ---- end-gas knock model (petrol spark-ignition only) -----------
+            # The unburned end gas is compressed isentropically by the piston and
+            # the advancing flame; if it auto-ignites before the flame arrives it
+            # detonates -> knock. A Livengood-Wu integral over the Douaud-Eyzat
+            # ignition delay (a standard gasoline correlation) decides when. Knock
+            # is promoted by high pressure (boost/CR), high temperature, advanced
+            # timing (more end-gas dwell at high P), and low octane -- all emergent.
+            if not diesel:
+                ddk = cph - cph_prev
+                if ddk < 0.0:
+                    ddk += cyc
+                rel_ivc = IVC - cph_prev
+                if rel_ivc < 0.0:
+                    rel_ivc += cyc
+                if rel_ivc <= ddk:                  # intake valve just closed
+                    cyl_knk[c, 0] = T               # trapped charge temp/pressure
+                    cyl_knk[c, 1] = Pc              # at start of compression
+                    cyl_knk[c, 2] = 0.0             # reset the knock integral
+                    cyl_knk[c, 3] = 0.0             # reset knocked-this-cycle flag
+                if running and not fuelcut and cyl_knk[c, 3] < 0.5:
+                    Tivc = cyl_knk[c, 0]; Pivc = cyl_knk[c, 1]
+                    if Pivc > 1.0 and Pc > Pivc:
+                        Tu = Tivc * (Pc / Pivc) ** ((g - 1.0) / g)
+                        if Tu > 320.0:
+                            # delay (s): 0.01768*(ON/100)^3.402*P[atm]^-1.7*exp(3800/Tu)
+                            tau = (knock_scale * 0.01768 * (octane * 0.01) ** 3.402
+                                   * (Pc / 101325.0) ** (-1.7) * np.exp(3800.0 / Tu))
+                            cyl_knk[c, 2] += dt / tau
+                            if cyl_knk[c, 2] >= 1.0:
+                                unburned = 1.0 - wiebe(f_now, wa, wm)
+                                if unburned > 0.05:
+                                    ki = unburned * Pc * 1.0e-6   # ~MPa of end gas
+                                    knock_acc += ki
+                                    knock_exc += ki
+                                    cyl_knk[c, 3] = 1.0           # one event / cycle
 
             # heat transfer to walls (lumped)
-            dQ -= ht * (T - wallT) * dt
+            q_w = ht * (T - wallT) * dt
+            dQ -= q_w
+            qwall_acc += q_w          # this heat banks into the metal (sim side)
 
             # ---- valve flows ----
             dm_in = 0.0
             dm_ex = 0.0
             dH = 0.0
+            dd = cph - cph_prev
+            if dd < 0.0:
+                dd += cyc
+            # the fresh-charge accumulator resets at intake-valve opening, then
+            # sums the real inducted air over the intake event (for fuel metering)
+            rel_i = IVO - cph_prev
+            if rel_i < 0.0:
+                rel_i += cyc
+            if ram_on and rel_i <= dd:
+                fresh[c] = 0.0
+
             fin = open_frac(cph, IVO, IVC, cyc)
-            if fin > 0.0:
+            if ram2:
+                # ---- 1D wave runner: breathe from THIS cylinder's runner head
+                # cell (it carries the runner's pressure wave); the head-cell
+                # draw is deposited as a source, advanced by gas_step below. ----
+                if fin > 0.0:
+                    rh = rho_r[c, 0]
+                    uh = mom_r[c, 0] / rh
+                    P_rh = (g - 1.0) * (Ene_r[c, 0] - 0.5 * rh * uh * uh)
+                    if P_rh < 1.0:
+                        P_rh = 1.0
+                    T_rh = P_rh / (rh * R)
+                    area = Ain * fin
+                    if P_rh >= Pc:
+                        md = orifice_mdot(P_rh, T_rh, Pc, area, Cd, g, R) * dt
+                        dm_in += md
+                        dH += md * cp * T_rh
+                        air_draw += md
+                        fresh[c] += md
+                        src_rm[c, 0] -= md          # mass leaves the runner head
+                        src_re[c, 0] -= md * cp * T_rh
+                        m_man -= md                 # bulk charge drains the plenum
+                        if m_man < 1e-9:
+                            m_man = 1e-9
+                    else:
+                        md = orifice_mdot(Pc, T, P_rh, area, Cd, g, R) * dt
+                        dm_in -= md
+                        dH -= md * cp * T
+                        air_draw -= md
+                        fresh[c] -= md
+                        src_rm[c, 0] += md          # reversion back into the runner
+                        src_re[c, 0] += md * cp * T
+                        m_man += md
+            elif ram1:
+                # ---- inertia-ram runner: integrate the air column's momentum ----
+                A_v = Ain * fin
+                if A_v > ram_amin:
+                    mdot = run_mdot[c]
+                    rho_up = MAP / (R * Tman)
+                    CA = Cd * A_v
+                    qd = mdot / CA
+                    dP_valve = qd * (qd if qd >= 0.0 else -qd) / (2.0 * rho_up)
+                    # column momentum: plenum pressure minus cylinder minus the
+                    # valve loss needed to pass the current flow
+                    mdot += dt * inert_k * (MAP - Pc - dP_valve)
+                    if mdot > col_mmax:
+                        mdot = col_mmax
+                    elif mdot < -col_mmax:
+                        mdot = -col_mmax
+                    run_mdot[c] = mdot
+                    md = mdot * dt
+                    if md >= 0.0:
+                        dm_in += md
+                        dH += md * cp * Tman
+                        air_draw += md        # induction: mass pulled from tract
+                        fresh[c] += md        # real fresh air trapped this cycle
+                        if four_stroke:
+                            m_man -= md
+                            if m_man < 1e-9:
+                                m_man = 1e-9
+                    else:
+                        dm_in += md           # md < 0: reversion out of cylinder
+                        dH += md * cp * T
+                        air_draw += md
+                        fresh[c] += md
+                        if four_stroke:
+                            m_man -= md       # back into the plenum
+                else:
+                    run_mdot[c] *= 0.6        # valve ~shut: column stagnates
+            elif fin > 0.0:
+                # ---- plain plenum breathing (no runner model) ----
                 area = Ain * fin
                 if MAP >= Pc:
                     md = orifice_mdot(MAP, Tman, Pc, area, Cd, g, R) * dt
@@ -618,6 +937,20 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
             Pt = (gex - 1.0) * (Ene[N - 1] - 0.5 * rho[N - 1] * ut * ut)
             Pt_acc += Pt
 
+        # ---- per-cylinder 1D intake runners (mode 2): advance each runner with
+        # its valve draw as a head-cell source and the mouth open to the plenum
+        # (MAP). The reflected wave that ram peaks each runner is emergent. ----
+        if ram2:
+            for c in range(ncyl):
+                rrho = rho_r[c]; rmom = mom_r[c]; rEne = Ene_r[c]
+                srm = src_rm[c]; sre = src_re[c]
+                for _ in range(nsub_r):
+                    gas_step(rrho, rmom, rEne, Nr, dx_r, dt_gas_r, g, R,
+                             patm, Tatm, MAP, Tman, damp_in, srm, sre,
+                             cell_vol_r)
+                    srm[0] = 0.0
+                    sre[0] = 0.0
+
         # ---- intake duct gas dynamics (induction sound is emergent) ----
         # The duct is a 1D Euler pipe excited at the head (cell 0) by the REAL
         # per-cylinder intake-valve mass flow (pulsed by valve lift -- the actual
@@ -690,53 +1023,92 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
         # net torque at the engine shaft, before the clutch
         T_eng = Tgas_torque - (fric0 + fricw * omega) - load + starter
 
-        if not coupled:
-            # open driveline: engine spins free, vehicle coasts on road load
+        if not has_veh:
+            # bench: engine spins free (free-rev dyno)
             omega += T_eng / inertia * dt
             if omega < 0.0:
                 omega = 0.0
             phi = 0.0
-            if has_veh and v > 0.0:
-                f_res = crr * vmass * grav + cda * v * v + brakef
-                v -= f_res / vmass * dt
-                if v < 0.0:
-                    v = 0.0
         else:
-            omega_in = (v / rw) * ratio      # gearbox-input speed (driven plate)
-            slip = omega - omega_in
-            phi += slip * dt                 # driveline wind-up
-            T_cl = kdl * phi + cdl * slip
-            # clutch slips once demanded torque exceeds its clamp capacity
-            if T_cl > Tcap:
-                T_cl = Tcap
-                phi = (Tcap - cdl * slip) / kdl
-            elif T_cl < -Tcap:
-                T_cl = -Tcap
-                phi = (-Tcap - cdl * slip) / kdl
-            # tyre grip: contact patch can't pass more than mu*m*g -> wheelspin,
-            # which unloads the clutch so the engine flares (emergent, not faked)
-            f_drive = T_cl * ratio / rw
-            f_max = mu * vmass * grav
-            if f_drive > f_max:
-                f_drive = f_max
-                T_cl = f_drive * rw / ratio
-                phi = (T_cl - cdl * slip) / kdl
-            elif f_drive < -f_max:
-                f_drive = -f_max
-                T_cl = f_drive * rw / ratio
-                phi = (T_cl - cdl * slip) / kdl
-            # engine reacts against the clutch torque
-            omega += (T_eng - T_cl) / inertia * dt
-            if omega < 0.0:
-                omega = 0.0
-            # vehicle: drive force minus road load (load only opposes motion)
-            if v > 0.0:
-                f_res = crr * vmass * grav + cda * v * v + brakef
+            vx = v
+            if not tyre_slip:
+                omega_w = vx / rw if rw > 0.0 else 0.0   # rigid: wheel = road
+            # ---- engine <-> clutch <-> gearbox-input (driven by the WHEEL) ----
+            if coupled:
+                omega_in = omega_w * ratio        # gearbox input = wheel x ratio
+                slip_cl = omega - omega_in
+                phi += slip_cl * dt               # driveline wind-up
+                T_cl = kdl * phi + cdl * slip_cl
+                if T_cl > Tcap:                   # clutch saturates (Coulomb)
+                    T_cl = Tcap
+                    phi = (Tcap - cdl * slip_cl) / kdl
+                elif T_cl < -Tcap:
+                    T_cl = -Tcap
+                    phi = (-Tcap - cdl * slip_cl) / kdl
+                omega += (T_eng - T_cl) / inertia * dt
+                if omega < 0.0:
+                    omega = 0.0
+                T_wheel = T_cl * ratio            # torque delivered to drive wheels
             else:
-                f_res = 0.0
-            v += (f_drive - f_res) / vmass * dt
-            if v < 0.0:
-                v = 0.0
+                omega += T_eng / inertia * dt     # declutched: engine free
+                if omega < 0.0:
+                    omega = 0.0
+                phi = 0.0
+                T_wheel = 0.0
+                omega_w = vx / rw if rw > 0.0 else 0.0   # wheel tracks the road
+
+            # ---- normal loads with quasi-static longitudinal transfer ----
+            # accel pitches load rearward (ax_long>0 -> onto a RWD driven axle,
+            # off an FWD one). Uses last sample's accel (lagged) to stay explicit.
+            N_fr = vmass * (g_eff * wd_front - ax_long * xfer)
+            N_re = vmass * (g_eff * (1.0 - wd_front) + ax_long * xfer)
+            if N_fr < 0.0:
+                N_fr = 0.0
+            if N_re < 0.0:
+                N_re = 0.0
+            if awd:
+                N_drive = N_fr + N_re
+            elif rear_driven:
+                N_drive = N_re
+            else:
+                N_drive = N_fr
+
+            # ---- driven-axle force (straight-line / dyno: no cornering) ----
+            f_grip = mu * N_drive
+            if tyre_slip:
+                # slip-ratio tyre: Fx = mu*N*MF(slip); the wheel is its own DOF,
+                # so wheelspin (and recovery) emerge. MF saturates at the grip
+                # limit so no friction-circle is needed.
+                vabs = (vx if vx >= 0.0 else -vx) + v_eps
+                kappa = (omega_w * rw - vx) / vabs
+                Fx = f_grip * tyre_mf(kappa, B_long, C_long)
+                if coupled:
+                    omega_w += (T_wheel - Fx * rw) / j_wheel * dt
+                    if omega_w < 0.0:
+                        omega_w = 0.0
+            else:
+                # rigid grip cap (dyno feel): deliver the wheel torque straight
+                # to the contact patch, clamped at the traction limit. No wheel
+                # DOF, no wheelspin.
+                Fx = T_wheel / rw
+                if Fx > f_grip:
+                    Fx = f_grip
+                elif Fx < -f_grip:
+                    Fx = -f_grip
+
+            # ---- body longitudinal motion ----
+            sgn = 1.0 if vx >= 0.0 else -1.0
+            roll = crr * vmass * g_eff if vx > 0.01 else 0.0
+            drag = cda * vx * vx
+            Fx_net = (Fx - drag * sgn - roll * sgn - brakef * sgn
+                      - vmass * grav * sin_grade)
+            ax_long = Fx_net / vmass
+            vx += ax_long * dt
+            if vx < 0.0:
+                vx = 0.0
+                if not coupled:
+                    omega_w = 0.0
+            v = vx
 
         theta += dth
         if theta > 1e7:
@@ -763,6 +1135,45 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
         lp2 += f_body * bp2
         filt[4] = lp2; filt[5] = bp2
         sig = lp1 + body_gain * bp2
+
+        # ---- mechanical combustion clatter (diesel knock / petrol edge) ----
+        # The per-sample combustion pressure-rise excites two structural
+        # resonances; the bandpass ring is the audible "knock". Level set per
+        # engine by clatter_mix (high for diesel CI, faint for petrol). It is
+        # rolled off with rpm: distinct knocks at idle, but at high firing rate
+        # they must NOT merge into a steady metallic buzz -- they recede into
+        # the general roar like a real engine.
+        if clatter_mix > 0.0:
+            rpm_s = omega * 9.5492966
+            clk_rpm = 1.0 / (1.0 + (rpm_s / 2200.0) * (rpm_s / 2200.0))
+            exc = clatter_exc * outgain * 0.015
+            lpc1 = filt[12]; bpc1 = filt[13]
+            hc1 = exc - lpc1 - d_clk1 * bpc1
+            bpc1 += f_clk1 * hc1
+            lpc1 += f_clk1 * bpc1
+            filt[12] = lpc1; filt[13] = bpc1
+            lpc2 = filt[14]; bpc2 = filt[15]
+            hc2 = exc - lpc2 - d_clk2 * bpc2
+            bpc2 += f_clk2 * hc2
+            lpc2 += f_clk2 * bpc2
+            filt[14] = lpc2; filt[15] = bpc2
+            sig += clatter_mix * clk_rpm * (bpc1 + 0.6 * bpc2)
+
+        # ---- spark knock "ping" (end-gas detonation rings the chamber) ----
+        if knock_aud > 0.0:
+            kexc = knock_exc * 0.6
+            lpk = filt[16]; bpk = filt[17]
+            hk = kexc - lpk - d_knk * bpk
+            bpk += f_knk * hk
+            lpk += f_knk * bpk
+            filt[16] = lpk; filt[17] = bpk
+            sig += knock_aud * bpk
+
+        # ---- muffler chamber HF transmission loss (one-pole LP on exhaust) ----
+        if muff_lp > 0.0:
+            ml = filt[18] + muff_lp * (sig - filt[18])
+            filt[18] = ml
+            sig = ml
 
         # ---- induction (intake-mouth) signal: DC-block + de-hash, then mix ----
         # NB: this path MUST be de-hashed like the exhaust, else the 1D duct's
@@ -799,7 +1210,13 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj,
     st[S_MMAN] = m_man
     st[S_TURBO] = omega_trb
     st[S_AIRFLOW] = air_ema
+    st[S_OMEGA_W] = omega_w
+    st[S_VY] = vy
+    st[S_YAW] = yaw
+    st[S_HEADING] = heading
     P[P_MAP] = map_acc / n_samples    # report manifold pressure for the UI
+    P[P_QWALL] = qwall_acc            # heat into the metal this block (thermal model)
     P[P_BOOSTOUT] = boost_out         # report actual boost (Pa, gauge)
+    P[P_KNOCK] = knock_acc            # knock intensity this block (ECU reads it)
 
     return torque_acc / n_samples

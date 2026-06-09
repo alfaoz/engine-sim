@@ -31,6 +31,7 @@ def run_preset(name):
     sim = EngineSim(cfg)
     sim.step_block(64)            # warmup compile
     sim.load_config(cfg)
+    sim.prewarm()                 # test warm idle/rev (cold start is a UI feature)
     print(f"\n=== {cfg.name} ===  ({cfg.displacement_cc():.0f}cc, "
           f"{cfg.stroke_cycle}-stroke, {sim.N}-cell exhaust)")
 
@@ -59,6 +60,7 @@ def test_drive():
     print("\n=== DRIVE: 1.0L triple in a Hatchback ===")
     sim = EngineSim(get_preset("1.0L inline-3"))
     sim.step_block(64); sim.load_config(get_preset("1.0L inline-3"))
+    sim.prewarm()
     sim.set_vehicle(get_vehicle("Hatchback"))
     crank_until_running(sim)
     advance(sim, 1.0)

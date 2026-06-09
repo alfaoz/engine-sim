@@ -20,6 +20,11 @@ class VehicleConfig:
     wheel_radius: float    # m
     final_drive: float
     gear_ratios: List[float] = field(default_factory=list)
+    # chassis / drivetrain (for load transfer, traction split, cornering)
+    drivetrain: str = "fwd"            # 'fwd' | 'rwd' | 'awd'
+    weight_dist_front: float = 0.58    # static fraction of weight on the front axle
+    wheelbase: float = 0.0             # m; 0 => auto-estimate from mass
+    cg_height: float = 0.0             # m; 0 => auto-estimate
 
     def n_gears(self):
         return len(self.gear_ratios)
@@ -49,11 +54,15 @@ class EngineConfig:
     idle_rpm: float = 850.0
     inertia: float = 0.18           # kg m^2 rotating inertia (flywheel-ish)
     power_tune: float = 1.0         # combustion calibration multiplier
+    octane: float = 95.0            # fuel RON (petrol); ignored for diesel
 
     # exhaust geometry (single collector+tailpipe lumped model)
     pipe_length: float = 1.4        # m, header+collector+tailpipe
     pipe_diameter: float = 0.050    # m
     runner_spread: float = 0.18     # fraction of pipe over which cyls inject
+    # muffler chamber volume (m^3); 0 => auto from displacement, <0 => straight
+    # pipe / open exhaust (no silencer -> raw, loud, bright)
+    muffler_volume: float = 0.0
 
     # intake tract (runner + airbox) for the 1D induction-acoustics duct
     intake_length: float = 0.45     # m, port -> airbox mouth
@@ -162,7 +171,7 @@ def _tdi_1400():
         name="1.4 TDI inline-4 (turbo diesel)",
         bore=0.0795, stroke=0.0955, conrod=0.144,
         compression_ratio=19.5, n_cylinders=4, stroke_cycle=4,
-        diesel=True, turbo_boost=80000.0,
+        diesel=True, turbo_boost=135000.0,   # ~1.35 bar (real small TDI boost)
         ignition_btdc=6.0, burn_duration=65.0,
         redline_rpm=5000.0, idle_rpm=850.0, inertia=0.22,
         pipe_length=1.8, pipe_diameter=0.050, runner_spread=0.20,
@@ -558,7 +567,7 @@ def _tdi_2000():
         name="2.0 TDI inline-4 (diesel)",
         bore=0.081, stroke=0.0955, conrod=0.144,
         compression_ratio=16.5, n_cylinders=4, stroke_cycle=4,
-        diesel=True, turbo_boost=115000.0,
+        diesel=True, turbo_boost=185000.0,   # ~1.85 bar (real 2.0 TDI 150 boost)
         ignition_btdc=6.0, burn_duration=62.0,
         redline_rpm=4800.0, idle_rpm=820.0, inertia=0.23,
         pipe_length=1.85, pipe_diameter=0.052, runner_spread=0.20,
@@ -658,6 +667,161 @@ def _citycar_1200():
     )
 
 
+# ---- tractors / agricultural / industrial diesels -------------------------
+def _tractor_3cyl():
+    return EngineConfig(
+        name="3.3L 3-cyl NA tractor diesel",
+        bore=0.104, stroke=0.130, conrod=0.205,
+        compression_ratio=17.5, n_cylinders=3, stroke_cycle=4,
+        diesel=True, turbo_boost=0.0,        # naturally aspirated workhorse
+        ignition_btdc=10.0, burn_duration=66.0,
+        redline_rpm=2600.0, idle_rpm=800.0, inertia=2.2,
+        pipe_length=1.6, pipe_diameter=0.060, runner_spread=0.18,
+        firing_order=[1, 2, 3],
+    )
+
+
+def _tractor_4cyl_turbo():
+    return EngineConfig(
+        name="4.5L 4-cyl turbo tractor diesel",
+        bore=0.106, stroke=0.127, conrod=0.210,
+        compression_ratio=17.0, n_cylinders=4, stroke_cycle=4,
+        diesel=True, turbo_boost=120000.0,
+        ignition_btdc=8.0, burn_duration=66.0,
+        redline_rpm=2400.0, idle_rpm=800.0, inertia=3.2,
+        pipe_length=1.9, pipe_diameter=0.070, runner_spread=0.22,
+        firing_order=[1, 3, 4, 2],
+    )
+
+
+def _tractor_6cyl():
+    return EngineConfig(
+        name="9.0L 6-cyl turbo tractor diesel",
+        bore=0.118, stroke=0.136, conrod=0.225,
+        compression_ratio=16.5, n_cylinders=6, stroke_cycle=4,
+        diesel=True, turbo_boost=180000.0,
+        ignition_btdc=6.0, burn_duration=70.0,
+        redline_rpm=2200.0, idle_rpm=750.0, inertia=6.0,
+        pipe_length=2.4, pipe_diameter=0.090, runner_spread=0.28,
+        firing_order=[1, 5, 3, 6, 2, 4],
+    )
+
+
+def _lister_single():
+    return EngineConfig(
+        name="1.4L slow-rev stationary diesel (Lister-type)",
+        bore=0.114, stroke=0.139, conrod=0.230,
+        compression_ratio=16.0, n_cylinders=1, stroke_cycle=4,
+        diesel=True, turbo_boost=0.0,
+        ignition_btdc=12.0, burn_duration=70.0,
+        # huge flywheel, ~650 rpm governed -> the classic thump-thump
+        redline_rpm=1300.0, idle_rpm=520.0, inertia=2.4,
+        pipe_length=1.2, pipe_diameter=0.055, runner_spread=0.0,
+        firing_order=[1],
+    )
+
+
+# ---- more motorcycles ------------------------------------------------------
+def _cbx_six():
+    return EngineConfig(
+        name="1.0L inline-6 (Honda CBX)",
+        bore=0.0645, stroke=0.0534, conrod=0.098,
+        compression_ratio=9.3, n_cylinders=6, stroke_cycle=4,
+        ignition_btdc=22.0, burn_duration=50.0,
+        redline_rpm=9800.0, idle_rpm=1100.0, inertia=0.06,
+        pipe_length=1.3, pipe_diameter=0.040, runner_spread=0.22,
+        firing_order=[1, 5, 3, 6, 2, 4],
+    )
+
+
+def _h2_two_stroke_triple():
+    return EngineConfig(
+        name="750cc 2-stroke triple (H2 Mach IV)",
+        bore=0.071, stroke=0.0635, conrod=0.120,
+        compression_ratio=7.0, n_cylinders=3, stroke_cycle=2,
+        diesel=False, turbo_boost=35000.0,      # crankcase scavenge delivery
+        ignition_btdc=18.0, burn_duration=44.0,
+        evo=92.0, evc=268.0, ivo=115.0, ivc=245.0,
+        redline_rpm=8000.0, idle_rpm=1200.0, inertia=0.045,
+        pipe_length=1.15, pipe_diameter=0.038, runner_spread=0.20,
+        firing_order=[1, 2, 3],
+    )
+
+
+def _ktm_690():
+    return EngineConfig(
+        name="690cc supermoto single (high-rev)",
+        bore=0.105, stroke=0.080, conrod=0.150,
+        compression_ratio=12.8, n_cylinders=1, stroke_cycle=4,
+        ignition_btdc=26.0, burn_duration=54.0,
+        redline_rpm=8500.0, idle_rpm=1450.0, inertia=0.045,
+        pipe_length=1.4, pipe_diameter=0.044, runner_spread=0.0,
+        firing_order=[1],
+    )
+
+
+def _goldwing_flat6():
+    return EngineConfig(
+        name="1.8L flat-6 (Gold Wing)",
+        bore=0.074, stroke=0.071, conrod=0.125,
+        compression_ratio=10.5, n_cylinders=6, stroke_cycle=4,
+        ignition_btdc=20.0, burn_duration=52.0,
+        redline_rpm=6000.0, idle_rpm=900.0, inertia=0.16,
+        pipe_length=1.7, pipe_diameter=0.046, runner_spread=0.24,
+        firing_order=[1, 4, 5, 2, 3, 6],
+    )
+
+
+# ---- exotic / many-cylinder ------------------------------------------------
+def _supra_2jz():
+    return EngineConfig(
+        name="3.0L inline-6 turbo (2JZ)",
+        bore=0.086, stroke=0.086, conrod=0.142,
+        compression_ratio=8.5, n_cylinders=6, stroke_cycle=4,
+        turbo_boost=110000.0,
+        ignition_btdc=20.0, burn_duration=52.0,
+        redline_rpm=7000.0, idle_rpm=750.0, inertia=0.20,
+        pipe_length=1.7, pipe_diameter=0.064, runner_spread=0.24,
+        firing_order=[1, 5, 3, 6, 2, 4],
+    )
+
+
+def _w16_quad_turbo():
+    return EngineConfig(
+        name="8.0L W16 quad-turbo (Bugatti)",
+        bore=0.086, stroke=0.0857, conrod=0.152,
+        compression_ratio=9.0, n_cylinders=16, stroke_cycle=4,
+        turbo_boost=160000.0,
+        ignition_btdc=18.0, burn_duration=50.0,
+        redline_rpm=6800.0, idle_rpm=900.0, inertia=0.42,
+        pipe_length=1.9, pipe_diameter=0.090, runner_spread=0.30,
+    )
+
+
+def _v16_na():
+    return EngineConfig(
+        name="7.0L V16 (NA luxury)",
+        bore=0.085, stroke=0.077, conrod=0.145,
+        compression_ratio=10.5, n_cylinders=16, stroke_cycle=4,
+        ignition_btdc=22.0, burn_duration=50.0,
+        redline_rpm=6500.0, idle_rpm=650.0, inertia=0.46,
+        pipe_length=2.0, pipe_diameter=0.085, runner_spread=0.30,
+    )
+
+
+def _radial_9():
+    return EngineConfig(
+        name="17L 9-cyl radial (aircraft)",
+        bore=0.130, stroke=0.142, conrod=0.300,
+        compression_ratio=6.5, n_cylinders=9, stroke_cycle=4,
+        ignition_btdc=25.0, burn_duration=52.0,
+        redline_rpm=2400.0, idle_rpm=550.0, inertia=4.0,
+        pipe_length=1.0, pipe_diameter=0.075, runner_spread=0.30,
+        # single-row radial fires every other cylinder -> even 80deg cadence
+        firing_order=[1, 3, 5, 7, 9, 2, 4, 6, 8],
+    )
+
+
 PRESETS = {
     # --- small / mopeds / scooters ---
     "50cc 2-stroke single": _moped_50cc,
@@ -669,14 +833,18 @@ PRESETS = {
     # --- motorcycles ---
     "125cc 4-stroke single": _moto_125,
     "650cc thumper single": _thumper_single,
+    "690cc supermoto single": _ktm_690,
     "689cc parallel-twin (270°)": _parallel_twin_270,
+    "750cc 2-stroke triple (H2)": _h2_two_stroke_triple,
     "1.25L boxer-twin (BMW)": _bmw_boxer,
     "1.3L L-twin (Ducati)": _ducati_ltwin,
     "1.9L V-twin (Harley)": _harley_vtwin,
     "765cc triple (Triumph)": _triumph_triple,
     "600cc inline-4 sportbike": _sportbike_600,
     "998cc cross-plane I4 (R1)": _r1_crossplane,
+    "1.0L inline-6 (Honda CBX)": _cbx_six,
     "1.1L V4 superbike (Ducati)": _ducati_v4,
+    "1.8L flat-6 (Gold Wing)": _goldwing_flat6,
     # --- cars: small / NA petrol ---
     "660cc inline-3 (kei NA)": _kei_660_na,
     "660cc inline-3 turbo (kei)": _kei_660_turbo,
@@ -696,12 +864,15 @@ PRESETS = {
     "4.8L V10 (LFA)": _v10_screamer,
     "5.2L V10 (R8/Huracan)": _v10_audi,
     "6.5L V12 (Ferrari)": _v12_ferrari,
+    "7.0L V16 (NA luxury)": _v16_na,
     # --- cars: forced induction petrol ---
     "1.8L inline-4 turbo": _turbo4_18,
     "2.0L turbo-4": _gti_2000,
     "2.5L flat-4 turbo (rally)": _boxer4_turbo,
+    "3.0L inline-6 turbo (2JZ)": _supra_2jz,
     "3.8L V6 twin-turbo (GT-R)": _v6_vr38,
     "4.4L V8 twin-turbo (S63)": _v8_s63,
+    "8.0L W16 quad-turbo (Bugatti)": _w16_quad_turbo,
     # --- diesels ---
     "1.4 TDI diesel-4": _tdi_1400,
     "2.0 TDI diesel-4": _tdi_2000,
@@ -709,6 +880,12 @@ PRESETS = {
     "6.6 V8 diesel (pickup)": _diesel_v8_66,
     "6.7 i6 diesel (truck)": _diesel_i6_67,
     "12.6 i6 diesel (bus)": _diesel_i6_126,
+    # --- tractors / industrial / aircraft ---
+    "3.3L 3-cyl tractor diesel": _tractor_3cyl,
+    "4.5L 4-cyl turbo tractor": _tractor_4cyl_turbo,
+    "9.0L 6-cyl turbo tractor": _tractor_6cyl,
+    "1.4L stationary diesel (Lister)": _lister_single,
+    "17L 9-cyl radial (aircraft)": _radial_9,
 }
 
 
@@ -726,23 +903,28 @@ VEHICLES = {
         wheel_radius=0.3, final_drive=1.0, gear_ratios=[]),
     "Scooter (CVT)": VehicleConfig(
         name="Scooter", mass=130.0, cd=0.7, frontal_area=0.55, crr=0.020,
-        wheel_radius=0.18, final_drive=4.2, gear_ratios=[2.2]),
+        wheel_radius=0.18, final_drive=4.2, gear_ratios=[2.2],
+        drivetrain="rwd", weight_dist_front=0.48, wheelbase=1.3, cg_height=0.55),
     "Moped": VehicleConfig(
         name="Moped", mass=95.0, cd=0.9, frontal_area=0.6, crr=0.020,
-        wheel_radius=0.20, final_drive=5.2, gear_ratios=[2.8]),
+        wheel_radius=0.20, final_drive=5.2, gear_ratios=[2.8],
+        drivetrain="rwd", weight_dist_front=0.47, wheelbase=1.2, cg_height=0.55),
     "Pit bike": VehicleConfig(
         name="Pit bike", mass=85.0, cd=0.7, frontal_area=0.55, crr=0.022,
         wheel_radius=0.22, final_drive=4.2,
-        gear_ratios=[2.6, 1.8, 1.35, 1.05]),
+        gear_ratios=[2.6, 1.8, 1.35, 1.05],
+        drivetrain="rwd", weight_dist_front=0.48, wheelbase=1.1, cg_height=0.55),
     "Small bike (commuter)": VehicleConfig(
         name="Commuter bike", mass=160.0, cd=0.62, frontal_area=0.58, crr=0.019,
         wheel_radius=0.28, final_drive=4.8,
-        gear_ratios=[2.7, 1.85, 1.4, 1.15, 0.96, 0.84]),
+        gear_ratios=[2.7, 1.85, 1.4, 1.15, 0.96, 0.84],
+        drivetrain="rwd", weight_dist_front=0.49, wheelbase=1.35, cg_height=0.58),
     "Motorcycle (sport)": VehicleConfig(
         name="Sport bike", mass=240.0, cd=0.58, frontal_area=0.6, crr=0.018,
         # final_drive folds in the primary reduction (~1.9) + chain (~2.9)
         wheel_radius=0.30, final_drive=5.6,
-        gear_ratios=[2.62, 1.95, 1.58, 1.36, 1.21, 1.10]),
+        gear_ratios=[2.62, 1.95, 1.58, 1.36, 1.21, 1.10],
+        drivetrain="rwd", weight_dist_front=0.50, wheelbase=1.4, cg_height=0.55),
     "Microcar": VehicleConfig(
         name="Microcar", mass=600.0, cd=0.34, frontal_area=1.7, crr=0.013,
         wheel_radius=0.24, final_drive=4.6,
@@ -766,37 +948,45 @@ VEHICLES = {
     "Sports car": VehicleConfig(
         name="Sports car", mass=1350.0, cd=0.32, frontal_area=2.0, crr=0.011,
         wheel_radius=0.33, final_drive=3.4,
-        gear_ratios=[3.2, 2.1, 1.5, 1.15, 0.9, 0.75]),
+        gear_ratios=[3.2, 2.1, 1.5, 1.15, 0.9, 0.75],
+        drivetrain="rwd", weight_dist_front=0.50, wheelbase=2.5, cg_height=0.46),
     "Supercar": VehicleConfig(
         name="Supercar", mass=1480.0, cd=0.33, frontal_area=1.9, crr=0.011,
         wheel_radius=0.34, final_drive=3.6,
-        gear_ratios=[3.13, 2.19, 1.63, 1.29, 1.03, 0.84, 0.69]),
+        gear_ratios=[3.13, 2.19, 1.63, 1.29, 1.03, 0.84, 0.69],
+        drivetrain="rwd", weight_dist_front=0.44, wheelbase=2.65, cg_height=0.44),
     "SUV": VehicleConfig(
         name="SUV", mass=2100.0, cd=0.35, frontal_area=2.8, crr=0.013,
         wheel_radius=0.36, final_drive=3.9,
-        gear_ratios=[3.8, 2.1, 1.4, 1.0, 0.78, 0.64]),
+        gear_ratios=[3.8, 2.1, 1.4, 1.0, 0.78, 0.64],
+        drivetrain="awd", weight_dist_front=0.54, wheelbase=2.8, cg_height=0.72),
     "Pickup truck (8-spd)": VehicleConfig(
         name="Pickup", mass=2400.0, cd=0.42, frontal_area=3.2, crr=0.013,
         wheel_radius=0.38, final_drive=3.7,
-        gear_ratios=[4.7, 3.1, 2.1, 1.67, 1.29, 1.0, 0.84, 0.67]),
+        gear_ratios=[4.7, 3.1, 2.1, 1.67, 1.29, 1.0, 0.84, 0.67],
+        drivetrain="rwd", weight_dist_front=0.56, wheelbase=3.4, cg_height=0.75),
     "Van": VehicleConfig(
         name="Van", mass=2000.0, cd=0.38, frontal_area=3.6, crr=0.013,
         wheel_radius=0.34, final_drive=4.0,
-        gear_ratios=[3.9, 2.3, 1.5, 1.05, 0.82, 0.7]),
+        gear_ratios=[3.9, 2.3, 1.5, 1.05, 0.82, 0.7],
+        drivetrain="fwd", weight_dist_front=0.57, wheelbase=3.0, cg_height=0.8),
     "Box truck (10-spd)": VehicleConfig(
         name="Box truck", mass=4500.0, cd=0.50, frontal_area=5.5, crr=0.014,
         wheel_radius=0.44, final_drive=4.3,
-        gear_ratios=[9.0, 6.5, 4.7, 3.4, 2.5, 1.9, 1.42, 1.1, 0.86, 0.73]),
+        gear_ratios=[9.0, 6.5, 4.7, 3.4, 2.5, 1.9, 1.42, 1.1, 0.86, 0.73],
+        drivetrain="rwd", weight_dist_front=0.5, wheelbase=3.8, cg_height=1.1),
     "Bus / lorry (12-spd)": VehicleConfig(
         name="Bus", mass=14000.0, cd=0.60, frontal_area=6.8, crr=0.015,
         wheel_radius=0.50, final_drive=3.4,
         gear_ratios=[11.7, 9.2, 7.1, 5.6, 4.4, 3.5,
-                     2.8, 2.2, 1.7, 1.35, 1.05, 0.84]),
+                     2.8, 2.2, 1.7, 1.35, 1.05, 0.84],
+        drivetrain="rwd", weight_dist_front=0.45, wheelbase=5.8, cg_height=1.3),
     "Semi / artic (16-spd)": VehicleConfig(
         name="Semi", mass=26000.0, cd=0.62, frontal_area=9.5, crr=0.0065,
         wheel_radius=0.52, final_drive=3.7,
         gear_ratios=[14.0, 11.5, 9.4, 7.7, 6.2, 5.1, 4.2, 3.4,
-                     2.8, 2.3, 1.9, 1.55, 1.25, 1.0, 0.84, 0.73]),
+                     2.8, 2.3, 1.9, 1.55, 1.25, 1.0, 0.84, 0.73],
+        drivetrain="rwd", weight_dist_front=0.35, wheelbase=4.0, cg_height=1.3),
     # --- extra cars ---
     "Kei car": VehicleConfig(
         name="Kei", mass=720.0, cd=0.33, frontal_area=1.9, crr=0.012,
@@ -813,31 +1003,38 @@ VEHICLES = {
     "Track car": VehicleConfig(
         name="Track car", mass=1150.0, cd=0.34, frontal_area=1.85, crr=0.012,
         wheel_radius=0.33, final_drive=3.9,
-        gear_ratios=[2.9, 2.05, 1.6, 1.3, 1.08, 0.91]),
+        gear_ratios=[2.9, 2.05, 1.6, 1.3, 1.08, 0.91],
+        drivetrain="rwd", weight_dist_front=0.48, wheelbase=2.4, cg_height=0.42),
     "Rally car (AWD)": VehicleConfig(
         name="Rally", mass=1230.0, cd=0.36, frontal_area=2.0, crr=0.016,
         wheel_radius=0.32, final_drive=4.1,
-        gear_ratios=[3.5, 2.35, 1.76, 1.38, 1.1, 0.92]),
+        gear_ratios=[3.5, 2.35, 1.76, 1.38, 1.1, 0.92],
+        drivetrain="awd", weight_dist_front=0.56, wheelbase=2.6, cg_height=0.5),
     "Large 4x4 (8-spd)": VehicleConfig(
         name="4x4", mass=2600.0, cd=0.38, frontal_area=3.0, crr=0.014,
         wheel_radius=0.40, final_drive=3.7,
-        gear_ratios=[4.7, 3.1, 2.1, 1.67, 1.29, 1.0, 0.84, 0.67]),
+        gear_ratios=[4.7, 3.1, 2.1, 1.67, 1.29, 1.0, 0.84, 0.67],
+        drivetrain="awd", weight_dist_front=0.52, wheelbase=2.9, cg_height=0.78),
     "Supercar (7-spd DCT)": VehicleConfig(
         name="Supercar", mass=1500.0, cd=0.34, frontal_area=1.92, crr=0.012,
         wheel_radius=0.34, final_drive=3.55,
-        gear_ratios=[3.13, 2.19, 1.63, 1.29, 1.03, 0.84, 0.69]),
+        gear_ratios=[3.13, 2.19, 1.63, 1.29, 1.03, 0.84, 0.69],
+        drivetrain="rwd", weight_dist_front=0.43, wheelbase=2.65, cg_height=0.44),
     "Hypercar (AWD)": VehicleConfig(
         name="Hypercar", mass=1450.0, cd=0.36, frontal_area=1.95, crr=0.012,
         wheel_radius=0.35, final_drive=3.4,
-        gear_ratios=[2.92, 2.04, 1.6, 1.32, 1.09, 0.92, 0.78]),
+        gear_ratios=[2.92, 2.04, 1.6, 1.32, 1.09, 0.92, 0.78],
+        drivetrain="awd", weight_dist_front=0.45, wheelbase=2.7, cg_height=0.43),
     "Muscle car": VehicleConfig(
         name="Muscle", mass=1750.0, cd=0.36, frontal_area=2.2, crr=0.012,
         wheel_radius=0.34, final_drive=3.55,
-        gear_ratios=[2.97, 2.07, 1.43, 1.0, 0.84, 0.66]),
+        gear_ratios=[2.97, 2.07, 1.43, 1.0, 0.84, 0.66],
+        drivetrain="rwd", weight_dist_front=0.54, wheelbase=2.9, cg_height=0.5),
     "Pickup (heavy tow)": VehicleConfig(
         name="HD Pickup", mass=3200.0, cd=0.45, frontal_area=3.4, crr=0.013,
         wheel_radius=0.40, final_drive=3.9,
-        gear_ratios=[4.7, 3.1, 2.1, 1.67, 1.29, 1.0, 0.84, 0.67]),
+        gear_ratios=[4.7, 3.1, 2.1, 1.67, 1.29, 1.0, 0.84, 0.67],
+        drivetrain="rwd", weight_dist_front=0.58, wheelbase=3.6, cg_height=0.8),
     "Compact SUV": VehicleConfig(
         name="Compact SUV", mass=1650.0, cd=0.33, frontal_area=2.5, crr=0.012,
         wheel_radius=0.34, final_drive=3.7,
@@ -846,15 +1043,18 @@ VEHICLES = {
     "Cruiser (V-twin)": VehicleConfig(
         name="Cruiser", mass=380.0, cd=0.70, frontal_area=0.75, crr=0.018,
         wheel_radius=0.40, final_drive=4.6,
-        gear_ratios=[3.3, 2.2, 1.6, 1.27, 1.05, 0.89]),
+        gear_ratios=[3.3, 2.2, 1.6, 1.27, 1.05, 0.89],
+        drivetrain="rwd", weight_dist_front=0.47, wheelbase=1.65, cg_height=0.55),
     "Superbike": VehicleConfig(
         name="Superbike", mass=205.0, cd=0.55, frontal_area=0.55, crr=0.017,
         wheel_radius=0.31, final_drive=5.8,
-        gear_ratios=[2.6, 2.0, 1.67, 1.44, 1.29, 1.15]),
+        gear_ratios=[2.6, 2.0, 1.67, 1.44, 1.29, 1.15],
+        drivetrain="rwd", weight_dist_front=0.51, wheelbase=1.42, cg_height=0.55),
     "Café racer": VehicleConfig(
         name="Café racer", mass=220.0, cd=0.62, frontal_area=0.62, crr=0.018,
         wheel_radius=0.30, final_drive=5.0,
-        gear_ratios=[2.5, 1.7, 1.3, 1.05, 0.9]),
+        gear_ratios=[2.5, 1.7, 1.3, 1.05, 0.9],
+        drivetrain="rwd", weight_dist_front=0.49, wheelbase=1.4, cg_height=0.55),
 }
 
 

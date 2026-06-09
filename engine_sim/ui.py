@@ -1,6 +1,9 @@
 """Dear PyGui control panel + live instrumentation for the engine simulator."""
 import math
+import os
+import json
 import threading
+import dataclasses
 from collections import deque
 import numpy as np
 import dearpygui.dearpygui as dpg
@@ -10,6 +13,8 @@ from .presets import (PRESETS, get_preset, EngineConfig,
                       VEHICLES, get_vehicle)
 from .sim import EngineSim, SAMPLE_RATE
 
+CUSTOM_FILE = os.path.join(os.path.dirname(__file__), "..", "custom_engines.json")
+
 GEX = 1.33
 RAIR = 287.0
 PATM = 101325.0
@@ -17,7 +22,10 @@ PATM = 101325.0
 
 class EngineUI:
     def __init__(self):
-        self.preset_names = list(PRESETS.keys())
+        self.custom_engines = {}        # name -> EngineConfig (user-saved)
+        self._load_custom_from_disk()
+        self.preset_names = list(PRESETS.keys()) + list(self.custom_engines.keys())
+        self._is_custom = False
         self.vehicle_names = list(VEHICLES.keys())
         self.out_device_map = {"System default": None}
         try:
@@ -68,9 +76,13 @@ class EngineUI:
             evo=g("evo"), evc=g("evc"), ivo=g("ivo"), ivc=g("ivc"),
             redline_rpm=g("redline"), idle_rpm=g("idle"),
             inertia=g("inertia"),
+            octane=g("octane"), power_tune=g("ptune"),
             pipe_length=g("pipelen"), pipe_diameter=g("pipedia") / 1000.0,
             runner_spread=g("spread"),
+            intake_length=g("intlen"), intake_diameter=g("intdia") / 1000.0,
+            muffler_volume=g("muffvol") / 1000.0,
             firing_order=self.sim.cfg.firing_order,
+            firing_angles=self.sim.cfg.firing_angles,
         )
 
     def push_config_to_widgets(self, cfg: EngineConfig):
@@ -93,7 +105,19 @@ class EngineUI:
         dpg.set_value("pipelen", cfg.pipe_length)
         dpg.set_value("pipedia", cfg.pipe_diameter * 1000)
         dpg.set_value("spread", cfg.runner_spread)
+        dpg.set_value("octane", cfg.octane)
+        dpg.set_value("muffvol", cfg.muffler_volume * 1000.0)
+        if dpg.does_item_exist("intlen"):
+            dpg.set_value("intlen", cfg.intake_length)
+            dpg.set_value("intdia", cfg.intake_diameter * 1000.0)
+            dpg.set_value("ptune", cfg.power_tune)
         self._building = False
+        self._is_custom = cfg.name in self.custom_engines
+        if dpg.does_item_exist("custom_lbl"):
+            tag = "custom" if self._is_custom else "stock"
+            dpg.set_value("custom_lbl", f"{tag}: {cfg.name}")
+            dpg.configure_item("custom_lbl", color=(150, 220, 150))
+        self._update_firing_label()
         self._update_info()
 
     def _update_info(self):
@@ -106,7 +130,7 @@ class EngineUI:
     def on_preset(self, sender, name):
         was_on = self.sim.is_audio_on()
         self.sim.stop_audio()
-        self.sim.load_config(get_preset(name))
+        self.sim.load_config(self._get_cfg(name))
         self.push_config_to_widgets(self.sim.cfg)
         if was_on:
             self.sim.warmup()
@@ -127,6 +151,7 @@ class EngineUI:
     def on_geometry_edit(self, *_):
         if not self._building:
             self._update_info()
+            self._mark_custom()
 
     def on_throttle(self, s, v):
         self.sim.set_throttle(v / 100.0)
@@ -139,6 +164,9 @@ class EngineUI:
 
     def on_backfire(self, s, v):
         self.sim.backfire = v
+
+    def on_prewarm(self, *_):
+        self.sim.prewarm()
 
     def on_vehicle(self, s, name):
         self.sim.set_vehicle(get_vehicle(name))
@@ -162,7 +190,7 @@ class EngineUI:
         self.sim.set_device(self.out_device_map.get(name))
 
     def on_mix_induction(self, s, on):
-        self.sim.mix_induction = 0.35 if on else 0.0
+        self.sim.mix_induction = 0.15 if on else 0.0
         self.sim.P[core.P_INGAIN] = self.sim.mix_induction
 
     def on_mix_body(self, s, on):
@@ -172,6 +200,94 @@ class EngineUI:
     def on_mix_sat(self, s, on):
         self.sim.mix_sat = 1.0 if on else 0.0
         self.sim.P[core.P_SAT] = self.sim.mix_sat
+
+    def on_mix_clatter(self, s, on):
+        self.sim.mix_clatter = bool(on)
+        self.sim.P[core.P_CLATTER] = self.sim._clatter_on if on else 0.0
+
+    def on_mix_knock(self, s, on):
+        self.sim.mix_knock = bool(on)
+        self.sim.P[core.P_KNOCKAUD] = self.sim._knock_on if on else 0.0
+
+    def on_mix_muffler(self, s, on):
+        self.sim.mix_muffler = bool(on)
+        self.sim.P[core.P_MUFFLP] = self.sim._muff_on if on else 0.0
+
+    def on_grade(self, s, v):
+        self.sim.set_grade(v / 100.0)          # slider is % slope
+
+    def on_tyre_slip(self, s, on):
+        self.sim.tyre_slip = bool(on)
+        self.sim.P[core.P_TYRESLIP] = 1.0 if on else 0.0
+
+    def on_octane(self, s, v):
+        self.sim.cfg.octane = float(v)
+        self.sim.P[core.P_OCTANE] = float(v)   # live (knock model reads it)
+
+    # -------------------------------------------------- custom engines / timing
+    def _get_cfg(self, name):
+        if name in self.custom_engines:
+            return dataclasses.replace(self.custom_engines[name])   # a copy
+        return get_preset(name)
+
+    def _load_custom_from_disk(self):
+        try:
+            with open(CUSTOM_FILE) as f:
+                data = json.load(f)
+            for n, d in data.items():
+                self.custom_engines[n] = EngineConfig(**d)
+        except Exception:
+            pass
+
+    def _save_custom_to_disk(self):
+        try:
+            with open(CUSTOM_FILE, "w") as f:
+                json.dump({n: dataclasses.asdict(c)
+                           for n, c in self.custom_engines.items()}, f, indent=2)
+        except Exception as e:
+            print("save failed:", e)
+
+    def _mark_custom(self):
+        self._is_custom = True
+        if dpg.does_item_exist("custom_lbl"):
+            dpg.set_value("custom_lbl", "CUSTOM (unsaved)")
+            dpg.configure_item("custom_lbl", color=(255, 200, 120))
+
+    def _update_firing_label(self):
+        if not dpg.does_item_exist("firing_lbl"):
+            return
+        cfg = self.sim.cfg
+        if cfg.firing_angles:
+            dpg.set_value("firing_lbl", f"uneven firing: {cfg.firing_angles}")
+        else:
+            fo = cfg.firing_order or list(range(1, cfg.n_cylinders + 1))
+            dpg.set_value("firing_lbl", f"firing order: {fo}")
+
+    def on_auto_timing(self, *_):
+        """Regenerate a clean even-firing order for the current cylinder count
+        (and drop any stale uneven-firing angles), then rebuild. Use this after
+        changing the number of cylinders so the timing matches."""
+        ncyl = int(dpg.get_value("ncyl"))
+        self.sim.cfg.firing_order = list(range(1, ncyl + 1))
+        self.sim.cfg.firing_angles = []
+        self.on_rebuild()
+        self._update_firing_label()
+
+    def on_save_engine(self, *_):
+        cfg = self.current_edited_config()
+        name = (dpg.get_value("custom_name") or "").strip()
+        if not name:
+            name = f"Custom {len(self.custom_engines) + 1}"
+        cfg.name = name
+        self.custom_engines[name] = cfg
+        self._save_custom_to_disk()
+        if name not in self.preset_names:
+            self.preset_names.append(name)
+            dpg.configure_item("preset", items=self.preset_names)
+        dpg.set_value("preset", name)
+        self._is_custom = False
+        dpg.set_value("custom_lbl", f"saved: {name}")
+        dpg.configure_item("custom_lbl", color=(150, 220, 150))
 
     def on_clear_live(self, *_):
         self.live_tq[:] = np.nan
@@ -192,6 +308,7 @@ class EngineUI:
         self.sim.P[core.P_REDLINE] = dpg.get_value("redline")
         self.sim.P[core.P_OUTGAIN] = 1.0 / dpg.get_value("outscale")
         self.sim.P[core.P_DAMP] = dpg.get_value("damp")
+        self._mark_custom()
 
     def on_audio_toggle(self, s, v):
         if v:
@@ -218,59 +335,73 @@ class EngineUI:
         self._dyno_thread.start()
 
     def _run_dyno(self, cfg):
-        """Inertial dyno on a private sim instance (doesn't touch live audio):
-        free-rev at WOT with a big flywheel, brake torque = I*dw/dt."""
+        """Steady-state dyno on a private sim instance (doesn't touch live audio).
+        Hold WOT at each rpm with a load PI loop and read brake torque directly
+        (gas torque - friction) -- the inertial I*dw/dt method smeared the curve
+        into a flat plateau (it caught the off-idle transient in low-rpm bins).
+        This gives the true humped VE/torque curve."""
         try:
             import math as _m
+            B = 512
+            dt_blk = B / SAMPLE_RATE
             sim = EngineSim(cfg)
             sim.step_block(64)
             sim.load_config(cfg)
+            sim.prewarm()
+            sim.P[core.P_NOISE] = 0.0       # clean read (no cycle roughness)
             sim.start_engine()
-            for _ in range(60):
-                sim.step_block(self.sim_block())
+            for _ in range(40):
+                sim.step_block(B)
                 if sim.state == "running":
                     break
             for _ in range(60):
-                sim.step_block(self.sim_block())
-            # Heavy flywheel scaled to engine size: the slow rev-up gives many
-            # samples per rpm and lets the turbo track quasi-steadily (a light
-            # flywheel revs too fast -> noisy curve + boost lag). Tiny engines
-            # still need a small wheel or they'd take an age to spin up.
-            Vd = (_m.pi / 4 * cfg.bore ** 2 * cfg.stroke * cfg.n_cylinders)
-            disp_l = Vd * 1e3
-            FLY = float(min(9.0, max(0.35, 3.5 * disp_l)))
-            sim.base_inertia = FLY
-            sim.set_throttle(1.0)
-            dt = self.sim_block() / SAMPLE_RATE
-            lo = cfg.idle_rpm * 1.4
+                sim.step_block(B)
+            sim.base_inertia = 4.0          # big flywheel -> stable load loop
+            lo = cfg.idle_rpm * 1.5
             hi = cfg.redline_rpm * 0.97
-            nb = 40
-            bin_sum = np.zeros(nb)
-            bin_cnt = np.zeros(nb)
-            for _ in range(9000):
-                w0 = sim.st[core.S_OMEGA]
-                sim.step_block(self.sim_block())
-                w1 = sim.st[core.S_OMEGA]
-                rpm = w1 * 60 / (2 * _m.pi)
-                tq = FLY * (w1 - w0) / dt
-                if sim.state == "running" and lo <= rpm <= hi:
-                    b = int((rpm - lo) / (hi - lo) * nb)
-                    if 0 <= b < nb:
-                        bin_sum[b] += tq
-                        bin_cnt[b] += 1.0
-                if rpm > hi or sim.state == "off":
-                    break
-            if bin_cnt.sum() < 8:
+            npts = 16
+            grid = np.linspace(lo, hi, npts)
+            rpms = []
+            tqs = []
+            for target in grid:
+                sim.set_throttle(1.0)
+                integ = max(0.0, sim.torque * 0.5)
+                # settle the load loop onto this rpm
+                for _ in range(150):
+                    err = sim.rpm - target
+                    integ = float(np.clip(integ + 0.02 * err, 0.0, 1e6))
+                    load = float(np.clip(integ + 0.6 * err, 0.0, 1e6))
+                    sim.set_load(load)
+                    sim.step_block(B)
+                    if sim.state != "running":
+                        break
+                if sim.state != "running":
+                    sim.start_engine()
+                    for _ in range(40):
+                        sim.step_block(B)
+                        if sim.state == "running":
+                            break
+                    continue
+                # measure brake torque (gas - friction), averaged
+                tacc = []
+                racc = []
+                for _ in range(60):
+                    err = sim.rpm - target
+                    integ = float(np.clip(integ + 0.02 * err, 0.0, 1e6))
+                    load = float(np.clip(integ + 0.6 * err, 0.0, 1e6))
+                    sim.set_load(load)
+                    sim.step_block(B)
+                    fr = sim.P[core.P_FRIC0] + sim.P[core.P_FRICW] * sim.st[core.S_OMEGA]
+                    tacc.append(sim.torque - fr)
+                    racc.append(sim.rpm)
+                rpms.append(float(np.mean(racc)))
+                tqs.append(float(np.mean(tacc)))
+            if len(rpms) < 4:
                 self._dyno_result = ([], [], [], 0.0, 0.0, 0.0, 0.0)
                 return
-            grid = lo + (np.arange(nb) + 0.5) / nb * (hi - lo)
-            # average torque per rpm bin, fill empties by interpolation
-            tqg = np.where(bin_cnt > 0, bin_sum / np.maximum(bin_cnt, 1), np.nan)
-            ok = ~np.isnan(tqg)
-            tqg = np.interp(grid, grid[ok], tqg[ok])
-            # smooth
-            k = np.ones(5) / 5.0
-            tqg = np.convolve(tqg, k, mode="same")
+            grid = np.array(rpms)
+            tqg = np.array(tqs)
+            tqg = np.convolve(tqg, np.ones(3) / 3.0, mode="same")
             hp = tqg * (grid * 2 * np.pi / 60) / 745.7
             iT = int(np.argmax(tqg)); iP = int(np.argmax(hp))
             self._dyno_result = (grid.tolist(), tqg.tolist(), hp.tolist(),
@@ -343,10 +474,36 @@ class EngineUI:
                           color=(10, 10, 10), parent="fire_draw")
 
     # ------------------------------------------------------------------- build
+    def _apply_theme(self):
+        """Global spacing/padding so panels and plots breathe (less cramped)."""
+        with dpg.theme() as theme:
+            with dpg.theme_component(dpg.mvAll):
+                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 12, 10)
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 7, 4)
+                dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 10, 7)
+                dpg.add_theme_style(dpg.mvStyleVar_ItemInnerSpacing, 7, 5)
+                dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 6)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 4)
+                dpg.add_theme_style(dpg.mvStyleVar_CellPadding, 8, 3)
+            with dpg.theme_component(dpg.mvPlot):
+                # tight padding so the data fills the panel (less dead border)
+                dpg.add_theme_style(dpg.mvPlotStyleVar_PlotPadding, 2, 2,
+                                    category=dpg.mvThemeCat_Plots)
+                dpg.add_theme_style(dpg.mvPlotStyleVar_LabelPadding, 2, 1,
+                                    category=dpg.mvThemeCat_Plots)
+                dpg.add_theme_style(dpg.mvPlotStyleVar_LegendPadding, 4, 3,
+                                    category=dpg.mvThemeCat_Plots)
+                dpg.add_theme_style(dpg.mvPlotStyleVar_LegendInnerPadding, 2, 2,
+                                    category=dpg.mvThemeCat_Plots)
+                dpg.add_theme_style(dpg.mvPlotStyleVar_MousePosPadding, 4, 4,
+                                    category=dpg.mvThemeCat_Plots)
+        dpg.bind_theme(theme)
+
     def build(self):
         dpg.create_context()
-        dpg.create_viewport(title="Engine Simulator — physics + 1D exhaust gas dynamics",
-                            width=1480, height=900)
+        self._apply_theme()
+        dpg.create_viewport(title="Engine Simulator - physics + 1D exhaust gas dynamics",
+                            width=1860, height=920)
 
         with dpg.window(tag="main"):
             # ---- top control bar ----
@@ -368,25 +525,33 @@ class EngineUI:
                 dpg.add_button(label="Blip", callback=self.blip)
                 dpg.add_checkbox(label="Lock graphs", default_value=True,
                                  callback=self.on_lock_graphs, tag="lock_graphs")
+                dpg.add_checkbox(label="Tyre slip", default_value=True,
+                                 callback=self.on_tyre_slip, tag="tyre_slip")
                 dpg.add_text("  Mix:")
-                dpg.add_checkbox(label="Induction", default_value=False,
+                dpg.add_checkbox(label="Induction", default_value=True,
                                  callback=self.on_mix_induction, tag="mix_ind")
                 dpg.add_checkbox(label="Body", default_value=True,
                                  callback=self.on_mix_body, tag="mix_body")
                 dpg.add_checkbox(label="Sat", default_value=True,
                                  callback=self.on_mix_sat, tag="mix_sat")
-                dpg.add_text("", tag="info_disp")
+                dpg.add_checkbox(label="Clatter", default_value=False,
+                                 callback=self.on_mix_clatter, tag="mix_clatter")
+                dpg.add_checkbox(label="Knock", default_value=False,
+                                 callback=self.on_mix_knock, tag="mix_knock")
+                dpg.add_checkbox(label="Muffler", default_value=True,
+                                 callback=self.on_mix_muffler, tag="mix_muffler")
 
             dpg.add_separator()
 
             with dpg.group(horizontal=True):
                 # ---- left: drive controls / readouts ----
-                with dpg.child_window(width=235, height=720):
+                with dpg.child_window(width=250, height=800):
                     with dpg.group(horizontal=True):
                         dpg.add_button(label="START (Enter)", width=110,
                                        callback=self.on_start)
                         dpg.add_button(label="STOP", width=90, callback=self.on_stop)
                     dpg.add_text("state: off", tag="state_val", color=(255, 220, 120))
+                    dpg.add_text("", tag="info_disp", color=(150, 150, 150))
                     dpg.add_separator()
                     with dpg.group(horizontal=True):
                         dpg.add_button(label="< Down (Q)", width=100,
@@ -398,6 +563,14 @@ class EngineUI:
                         dpg.add_text("N", tag="gear_val", color=(255, 230, 120))
                         dpg.add_text("   Speed")
                         dpg.add_text("0 km/h", tag="speed_val", color=(160, 220, 255))
+                    dpg.add_separator()
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("Drivetrain", color=(200, 220, 200))
+                        dpg.add_text("-", tag="drive_val", color=(255, 230, 120))
+                    dpg.add_text("Incline (%)")
+                    dpg.add_slider_float(tag="grade", default_value=0.0,
+                                         min_value=-25.0, max_value=25.0, width=200,
+                                         callback=self.on_grade)
                     dpg.add_separator()
                     with dpg.group(horizontal=True):
                         with dpg.group():
@@ -417,39 +590,70 @@ class EngineUI:
                                          max_value=400.0, width=200,
                                          callback=self.on_load)
                     dpg.add_separator()
-                    dpg.add_text("RPM", color=(120, 200, 255))
-                    dpg.add_text("0", tag="rpm_val")
                     with dpg.group(horizontal=True):
-                        with dpg.group():
-                            dpg.add_text("Power", color=(255, 220, 120))
-                            dpg.add_text("0", tag="pwr_val")
-                            dpg.add_text("Torque (Nm)", color=(120, 255, 160))
-                            dpg.add_text("0", tag="trq_val")
-                            dpg.add_text("BMEP (bar)", color=(160, 230, 160))
-                            dpg.add_text("0", tag="bmep_val")
-                            dpg.add_text("MAP (kPa)", color=(255, 200, 120))
-                            dpg.add_text("0", tag="map_val")
-                        with dpg.group():
-                            dpg.add_text("Boost (kPa)", color=(255, 180, 120))
-                            dpg.add_text("0", tag="boost_val")
-                            dpg.add_text("VE (%)", color=(150, 220, 255))
-                            dpg.add_text("0", tag="ve_val")
-                            dpg.add_text("EGT (°C)", color=(255, 150, 120))
-                            dpg.add_text("0", tag="egt_val")
-                            dpg.add_text("Peak cyl (bar)", color=(255, 160, 160))
-                            dpg.add_text("0", tag="pk_val")
-                    dpg.add_text("λ (lambda)", color=(200, 200, 255))
-                    dpg.add_text("0", tag="lam_val")
+                        dpg.add_text("RPM", color=(120, 200, 255))
+                        dpg.add_text("0", tag="rpm_val")
+                    # fixed-column metric table -> values never shift the layout
+                    rows = [
+                        (("Pwr", (255, 220, 120), "pwr_val", ""),
+                         ("Bst", (255, 180, 120), "boost_val", "kPa")),
+                        (("Trq", (120, 255, 160), "trq_val", "Nm"),
+                         ("VE", (150, 220, 255), "ve_val", "%")),
+                        (("BMEP", (160, 230, 160), "bmep_val", "bar"),
+                         ("EGT", (255, 150, 120), "egt_val", "C")),
+                        (("MAP", (255, 200, 120), "map_val", "kPa"),
+                         ("Pcyl", (255, 160, 160), "pk_val", "bar")),
+                        (("Lam", (200, 200, 255), "lam_val", ""), None),
+                    ]
+                    with dpg.table(header_row=False, borders_innerH=False,
+                                   borders_outerH=False, borders_innerV=False,
+                                   borders_outerV=False, policy=dpg.mvTable_SizingFixedFit):
+                        dpg.add_table_column(init_width_or_weight=40, width_fixed=True)
+                        dpg.add_table_column(init_width_or_weight=78, width_fixed=True)
+                        dpg.add_table_column(init_width_or_weight=42, width_fixed=True)
+                        dpg.add_table_column(init_width_or_weight=78, width_fixed=True)
+                        for left, right in rows:
+                            with dpg.table_row():
+                                for cell in (left, right):
+                                    if cell is None:
+                                        dpg.add_text(""); dpg.add_text("")
+                                        continue
+                                    lbl, col, tag, unit = cell
+                                    dpg.add_text(lbl, color=col)
+                                    with dpg.group(horizontal=True):
+                                        dpg.add_text("--", tag=tag)
+                                        if unit:
+                                            dpg.add_text(unit, color=(110, 110, 110))
+                    # ---- temperature (thermostat gauge + prewarm) ----
+                    dpg.add_separator()
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("TEMP", color=(255, 170, 120))
+                        dpg.add_text("cold", tag="warm_lbl", color=(150, 200, 255))
+                        dpg.add_button(label="Prewarm", width=78,
+                                       callback=self.on_prewarm)
+                    dpg.add_progress_bar(tag="temp_bar", default_value=0.0,
+                                         width=-1, overlay="20 C")
+                    with dpg.group(horizontal=True):
+                        self._metric("Oil ", "oil_val", (220, 200, 140), "C")
+                        self._metric("Metl", "metal_val", (230, 170, 140), "C")
                     dpg.add_separator()
                     dpg.add_text("FIRING", color=(255, 200, 150))
                     with dpg.drawlist(width=222, height=92, tag="fire_draw"):
                         pass
+                    # colour legend for the stroke phases drawn above
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("Power", color=(230, 90, 60))
+                        dpg.add_text("Exh", color=(150, 150, 160))
+                        dpg.add_text("Int", color=(70, 150, 230))
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("Comp", color=(190, 165, 80))
+                        dpg.add_text("Fire!", color=(255, 215, 90))
                     dpg.add_text("", tag="fire_lbl", color=(170, 170, 170))
 
                 # ---- middle: plots (2-column grid of compact graphs) ----
-                with dpg.child_window(width=800, height=760):
-                    pw = 388          # per-plot width in the 2-up rows
-                    ph = 168          # compact plot height
+                with dpg.child_window(width=860, height=800):
+                    pw = 410          # per-plot width in the 2-up rows
+                    ph = 176          # compact plot height
 
                     with dpg.group(horizontal=True):
                         with dpg.plot(label="Exhaust pipe pressure (wave -> sound)",
@@ -522,7 +726,7 @@ class EngineUI:
                                                callback=self.on_clear_live)
                             dpg.add_text("WOT sweep", tag="dyno_status",
                                          color=(170, 170, 170))
-                            with dpg.plot(label="Dyno — torque & power vs RPM",
+                            with dpg.plot(label="Dyno - torque & power vs RPM",
                                           height=ph - 36, width=pw, no_inputs=True,
                                           tag="plot_dyno"):
                                 dpg.add_plot_legend()
@@ -536,14 +740,14 @@ class EngineUI:
                                                         label="power")
 
                 # ---- right: engine design parameters ----
-                with dpg.child_window(width=300, height=720):
+                with dpg.child_window(width=320, height=800):
                     dpg.add_text("GEOMETRY", color=(180, 180, 255))
                     self._num("bore", "Bore (mm)", 80, 20, 140)
                     self._num("stroke", "Stroke (mm)", 80, 20, 140)
                     self._num("conrod", "Conrod (mm)", 140, 50, 250)
                     self._num("cr", "Compression ratio", 10, 5, 24)
                     dpg.add_input_int(label="Cylinders", tag="ncyl", default_value=4,
-                                      min_value=1, max_value=12, width=120,
+                                      min_value=1, max_value=16, width=120,
                                       callback=self.on_geometry_edit)
                     dpg.add_radio_button(("4-stroke", "2-stroke"), tag="cycle",
                                          default_value="4-stroke", horizontal=True,
@@ -559,11 +763,16 @@ class EngineUI:
                     self._num("evc", "EVC (deg)", 375, 320, 420)
                     self._num("ivo", "IVO (deg)", 355, 300, 420)
                     self._num("ivc", "IVC (deg)", 585, 500, 640)
+                    dpg.add_input_float(tag="octane", label="Fuel octane (RON)",
+                                        default_value=95.0, min_value=80.0,
+                                        max_value=110.0, width=120, step=0,
+                                        callback=self.on_octane, on_enter=False)
                     dpg.add_separator()
                     dpg.add_text("EXHAUST", color=(150, 255, 220))
                     self._num("pipelen", "Pipe length (m)", 1.5, 0.3, 3.0)
                     self._num("pipedia", "Pipe dia (mm)", 50, 18, 90)
                     self._num("spread", "Runner spread", 0.2, 0.0, 0.4)
+                    self._num("muffvol", "Muffler vol (L, <0 straight)", 0, -1, 60)
                     dpg.add_separator()
                     dpg.add_text("DYNAMICS", color=(220, 220, 220))
                     self._num("redline", "Redline (rpm)", 7000, 3000, 12000, live=True)
@@ -575,13 +784,43 @@ class EngineUI:
                               live=True)
                     self._num("damp", "Exhaust damping", 0.0015, 0.0, 0.02, live=True)
                     dpg.add_slider_float(tag="backfire", label="Backfire (overrun)",
-                                         default_value=1.0, min_value=0.0,
+                                         default_value=0.0, min_value=0.0,
                                          max_value=3.0, width=120,
                                          callback=self.on_backfire)
                     dpg.add_separator()
                     dpg.add_button(label="REBUILD ENGINE", width=-1,
                                    callback=self.on_rebuild,
                                    tag="rebuild_btn")
+
+                # ---- far right: custom engine / timing / advanced ----
+                with dpg.child_window(width=290, height=800):
+                    dpg.add_text("CUSTOM ENGINE", color=(255, 220, 150))
+                    dpg.add_text("stock", tag="custom_lbl", color=(150, 200, 150),
+                                 wrap=270)
+                    dpg.add_text("Edit any value -> becomes custom. Name + Save:",
+                                 color=(140, 140, 140), wrap=270)
+                    dpg.add_input_text(tag="custom_name", hint="my engine name",
+                                       width=-1)
+                    dpg.add_button(label="SAVE ENGINE", width=-1,
+                                   callback=self.on_save_engine)
+                    dpg.add_separator()
+                    dpg.add_text("TIMING / CYLINDERS", color=(255, 200, 150))
+                    dpg.add_text("After changing cylinder count, click:",
+                                 color=(140, 140, 140), wrap=270)
+                    dpg.add_button(label="AUTO-ADJUST TIMING", width=-1,
+                                   callback=self.on_auto_timing)
+                    dpg.add_text("firing order: --", tag="firing_lbl",
+                                 color=(170, 170, 170), wrap=270)
+                    dpg.add_separator()
+                    dpg.add_text("ADVANCED (not on main panel)",
+                                 color=(180, 180, 255))
+                    self._num("intlen", "Intake length (m)", 0.45, 0.1, 1.0)
+                    self._num("intdia", "Intake dia (mm)", 55, 20, 110)
+                    self._num("ptune", "Power tune (x)", 1.0, 0.5, 1.6)
+                    dpg.add_separator()
+                    dpg.add_text("VEHICLE", color=(200, 220, 200))
+                    dpg.add_text("--", tag="veh_info", color=(180, 180, 180),
+                                 wrap=270)
 
         self.push_config_to_widgets(self.sim.cfg)
 
@@ -599,6 +838,14 @@ class EngineUI:
         dpg.add_input_float(tag=tag, label=label, default_value=float(default),
                             min_value=float(mn), max_value=float(mx), width=120,
                             step=0, callback=cb, on_enter=False)
+
+    def _metric(self, label, tag, color, unit=""):
+        """One compact readout line: coloured label, value, dim unit."""
+        with dpg.group(horizontal=True):
+            dpg.add_text(label, color=color)
+            dpg.add_text("--", tag=tag)
+            if unit:
+                dpg.add_text(unit, color=(105, 105, 105))
 
     # ------------------------------------------------------------------- frame
     def update_plots(self):
@@ -663,16 +910,24 @@ class EngineUI:
             lam = (23.0 / thr) / 14.5
         else:
             lam = 1.0
-        dpg.set_value("rpm_val", f"{sim.rpm:7.0f}")
-        dpg.set_value("pwr_val", f"{hp:.0f} hp ({kw:.0f} kW)")
-        dpg.set_value("trq_val", f"{sim.torque:7.1f}")
-        dpg.set_value("bmep_val", f"{bmep:6.1f}")
-        dpg.set_value("map_val", f"{MAP/1000:6.1f}")
-        dpg.set_value("boost_val", f"{boost:6.1f}")
-        dpg.set_value("ve_val", f"{ve:5.0f}")
-        dpg.set_value("egt_val", f"{egt:5.0f}")
-        dpg.set_value("pk_val", f"{sim.scope_p.max()/1e5:6.1f}")
-        dpg.set_value("lam_val", "—" if not np.isfinite(lam) else f"{lam:4.2f}")
+        dpg.set_value("rpm_val", f"{sim.rpm:.0f}")
+        dpg.set_value("pwr_val", f"{hp:.0f}hp/{kw:.0f}kW")
+        dpg.set_value("trq_val", f"{sim.torque:.0f}")
+        dpg.set_value("bmep_val", f"{bmep:.1f}")
+        dpg.set_value("map_val", f"{MAP/1000:.0f}")
+        dpg.set_value("boost_val", f"{boost:.1f}")
+        dpg.set_value("ve_val", f"{ve:.0f}")
+        dpg.set_value("egt_val", f"{egt:.0f}")
+        dpg.set_value("pk_val", f"{sim.scope_p.max()/1e5:.0f}")
+        dpg.set_value("lam_val", "--" if not np.isfinite(lam) else f"{lam:.2f}")
+
+        # temperature gauge (coolant) + oil/metal + warm-up state
+        wf = getattr(sim, "warm_frac", 1.0)
+        dpg.set_value("temp_bar", float(wf))
+        dpg.configure_item("temp_bar", overlay=f"{sim.coolant_C:.0f} C coolant")
+        dpg.set_value("oil_val", f"{sim.T_oil - 273.15:.0f}")
+        dpg.set_value("metal_val", f"{sim.T_metal - 273.15:.0f}")
+        dpg.set_value("warm_lbl", "warm" if wf > 0.95 else "warming")
 
         # exhaust pipe pressure profile (the wave)
         N = sim.N
@@ -749,6 +1004,15 @@ class EngineUI:
         dpg.fit_axis_data("turbo_x"); dpg.fit_axis_data("turbo_y")
         dpg.set_value("map_s", [fx, list(self.h_map)])
         dpg.fit_axis_data("map_x"); dpg.fit_axis_data("map_y")
+
+        # drivetrain readout + vehicle info panel
+        veh = sim.vehicle
+        dpg.set_value("drive_val", getattr(veh, "drivetrain", "-").upper())
+        if dpg.does_item_exist("veh_info"):
+            dpg.set_value("veh_info",
+                          f"{veh.name}: {veh.mass:.0f} kg, "
+                          f"{getattr(veh, 'drivetrain', '?').upper()}, "
+                          f"{veh.n_gears()}-spd, wheel {veh.wheel_radius:.2f} m")
 
         # firing diagram + dyno result hand-off from the worker thread
         self._draw_firing()
