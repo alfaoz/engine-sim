@@ -1206,16 +1206,17 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
         Pin_acc = 0.0
         if Ni > 0 and ingain > 0.0:
             # sound-only runner: excited by the real valve draw, open at the
-            # mouth to the boost/airbox reservoir which refills it.
-            src_in_m[0] = -air_draw
-            src_in_E[0] = -air_draw * cp * Tman
+            # mouth to the boost/airbox reservoir which refills it. The draw is
+            # spread evenly over the CFL substeps: depositing the whole sample's
+            # mass into one cell on one substep made the source a sample-rate
+            # impulse train whose broadband hash was most of the induction
+            # "buzz". Same total mass/energy per sample, continuous in time.
+            src_in_m[0] = -air_draw / nsub_in
+            src_in_E[0] = -air_draw * cp * Tman / nsub_in
             for _ in range(nsub_in):
                 gas_step_q(rho_in, mom_in, Ene_in, Ni, dx_in, dt_gas_in, g, R,
                            patm, Tatm, Pboost, Tman, damp_in, src_in_m, src_in_E,
                            pa_in, fa_in, wk_in, 0.12)
-                for k in range(Ni):
-                    src_in_m[k] = 0.0
-                    src_in_E[k] = 0.0
                 uin = mom_in[Ni - 1] / rho_in[Ni - 1]
                 Pin = (g - 1.0) * (Ene_in[Ni - 1] - 0.5 * rho_in[Ni - 1] * uin * uin)
                 Pin_acc += Pin

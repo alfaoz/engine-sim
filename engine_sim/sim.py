@@ -78,9 +78,9 @@ class EngineSim:
         self.tc_cut = 0.0          # current TC power cut (0..1), telemetry
         self.tyre_slip = True      # slip-ratio tyre model; off = rigid grip cap
         # audio source mix (for A/B-ing real vs coloration)
-        # induction OFF by default: the current 1D-duct coupling is a numerical
-        # hack (per-sample impulse into one cell) that buzzes -- it needs a real
-        # airbox + throttled boundary before it earns a place in the mix.
+        # the duct's valve-draw source is spread over the CFL substeps (it was a
+        # per-sample impulse into one cell, which buzzed); a real airbox +
+        # throttled boundary would still be more physical than the reservoir end.
         self.mix_induction = 0.15  # induction mix ON by default (kept modest:
         #                            it runs hot/clips at higher levels)
         # body resonator is now light voicing on top of the REAL expansion-chamber
