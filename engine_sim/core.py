@@ -976,7 +976,18 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     air_left = air * (1.0 - bfrac)
                     if air_left < 0.0:
                         air_left = 0.0
-                    cyl_chem[c, 0] = afterfire * fuel_un / m
+                    # only fuel that never saw a FLAME survives as ignitable
+                    # vapour. A fired cycle's rich surplus exits as combustion
+                    # products (CO / cracked HC) -- it stinks, it does not pop.
+                    # comp is the flame completeness, so the poppable fraction
+                    # is (1-comp): ~0 for any normal burn, ~1 for a misfire.
+                    # (Banking ALL surplus made cold running pile mg of "fuel"
+                    # per cycle into the pipe, permanently above the
+                    # flammability gate -> machine-gun pops on every overrun.)
+                    unflamed = 1.0 - comp
+                    if unflamed < 0.0:
+                        unflamed = 0.0
+                    cyl_chem[c, 0] = afterfire * fuel_un * unflamed / m
                     cyl_chem[c, 1] = air_left / m
                     # X of the injected fuel deposits on the port walls
                     # (sum of dxb over the cycle is 1, so this banks X*inj)
