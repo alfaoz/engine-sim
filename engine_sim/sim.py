@@ -578,9 +578,13 @@ class EngineSim:
         # dissipative muffler's glass-pack absorbs ~50-90% of a wave per pass;
         # a purely reflective chamber keeps the coherent ring ("tube"). Not
         # for straight pipes or 2-stroke chambers (those SHOULD ring).
+        # per-substep loss sized from dwell: a wave spends ~L_ch/c ~ 1 ms in
+        # the chamber (~180 CFL substeps), so 0.006/substep absorbs ~2/3 of a
+        # pass -- glass-pack territory. (0.06 annihilated the output: ~1e-5
+        # survival per pass.)
         self.pk_ex = np.zeros(N)
         if cfg.stroke_cycle == 4 and not self._straight:
-            self.pk_ex[self.ex_area > 1.5 * pipe_area] = 0.06
+            self.pk_ex[self.ex_area > 1.5 * pipe_area] = 0.006
         self.pk_in = np.zeros(max(1, Ni))
         self.pk_run = np.zeros(self.Nr)
 
