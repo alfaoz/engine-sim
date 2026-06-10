@@ -157,8 +157,8 @@ P_NBANKS      = 105 # number of separate exhaust banks (V/W engines -> 2+)
 P_AFTERFIRE   = 106 # rich-running afterfire intensity (over-fuel flames/pops)
 
 # --- ground-reflection image source (the "room": mic stands over asphalt) ---
-P_GND_D       = 107 # image-path extra delay (samples)
-P_GND_A       = 108 # image amplitude ratio r_direct/r_image (0 = disabled)
+P_GND_D       = 107 # (legacy, unused: per-bank delays live in the rad table)
+P_GND_A       = 108 # (legacy, unused: per-bank gains live in the rad table)
 
 P_FUELUSED    = 109 # (out) fuel mass injected this block (kg)
 
@@ -521,7 +521,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                    rho, mom, Ene, rho_in, mom_in, Ene_in,
                    run_mdot, fresh, cyl_knk, cyl_chem, pipe_chem,
                    rho_r, mom_r, Ene_r, src_rm, src_re,
-                   out_audio, scope_p, n_scope, filt, gnd,
+                   out_audio, scope_p, n_scope, filt, gnd, rad, mdot_prev,
                    pa_ex, fa_ex, wk_ex,
                    pa_in, fa_in, wk_in,
                    pa_run, fa_run, wk_run,
@@ -638,11 +638,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     # hears the tailpipe's mirror image under the asphalt -- +6 dB coherent
     # low end and a natural comb in the mids, i.e. an outdoor car instead of
     # a source floating in a void.
-    gnd_n = gnd.shape[0]
-    gnd_d = int(P[P_GND_D])
-    if gnd_d >= gnd_n:
-        gnd_d = gnd_n - 1
-    gnd_a = P[P_GND_A]
+    gnd_n = gnd.shape[0]   # multi-tap radiation delay ring (all paths share it)
     redline = P[P_REDLINE]
     running = P[P_RUNNING] > 0.5
     starter = P[P_STARTER]
@@ -776,6 +772,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
         nbanks = 1
     src_m = np.zeros((nbanks, N))
     src_E = np.zeros((nbanks, N))
+    mdot_b = np.zeros(nbanks)    # per-bank tailpipe mass flow this sample
 
     # intake duct: its own CFL substepping (cooler -> slower sound -> usually
     # fewer substeps than the hot exhaust). Allocate min size 1 when disabled.
@@ -1315,7 +1312,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
         # summed banks' exit MASS-FLOW (a monopole source: what the pipe blows
         # into the air is what you hear, as d(mdot)/dt at the listener) -- the
         # bank-to-bank cadence (cross-plane bank split) gives the V8/W16 rumble.
-        mdot_acc = 0.0
+        for b in range(nbanks):
+            mdot_b[b] = 0.0
         for _ in range(nsub):
             for b in range(nbanks):
                 gas_step_q(rho[b], mom[b], Ene[b], N, dx, dt_gas, gex, Rex,
@@ -1327,7 +1325,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     src_m[b, k] = 0.0
                     src_E[b, k] = 0.0
             for b in range(nbanks):
-                mdot_acc += mom[b, N - 1] * fa_ex[N]   # rho*u*A at the exit
+                mdot_b[b] += mom[b, N - 1] * fa_ex[N]   # rho*u*A at the exit
 
         # ---- turbulent afterfire ignition (random in time, NOT valve-locked).
         # A flammable pocket ignites when turbulent mixing folds it onto hot
@@ -1564,25 +1562,37 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             theta = _wrap(theta, cyc)
         torque_acc += Tgas_torque
 
-        # ---- audio output: monopole radiation from the tailpipe orifice ----
-        # p(listener) = d(mdot_exit)/dt / (4*pi*r): an unbaffled open pipe end
-        # radiates as a point source of volume flow; differentiating the exit
-        # mass flow gives the far-field pressure. The 1/(4*pi*r) and the
-        # full-scale Pa reference both live in outgain (set in sim._build).
-        mdot_t = mdot_acc / nsub
-        raw = (mdot_t - filt[20]) * sr      # d(mdot)/dt  (kg/s^2)
-        filt[20] = mdot_t
-        if gnd_a > 0.0:
-            gi = int(filt[22])
-            gnd[gi] = raw
-            j = gi - gnd_d
-            if j < 0:
-                j += gnd_n
-            raw = raw + gnd_a * gnd[j]
-            gi += 1
-            if gi >= gnd_n:
-                gi = 0
-            filt[22] = gi
+        # ---- audio output: per-bank monopole radiation from each tailpipe ----
+        # p(listener) = sum over pipes of d(mdot_exit)/dt / (4*pi*r_path): an
+        # unbaffled open pipe end radiates as a point source of volume flow.
+        # Each bank's tailpipe sits at ITS OWN position under the car, so each
+        # gets its own direct ray and its own ground-image ray (rad[b] =
+        # [direct delay, direct gain, image delay, image gain], gains are
+        # r_ref/r_path with the 1/(4*pi*r_ref) reference in outgain). All
+        # paths write into one shared multi-tap delay ring; the read head is
+        # this sample's summed arrival. The sub-ms inter-pipe delays break
+        # the phase coherence a single summed point source imposes -- twin
+        # pipes half a metre apart do not comb like one pipe. A single-bank
+        # engine has one centred pipe and reproduces the old geometry exactly.
+        gi = int(filt[22])
+        for b in range(nbanks):
+            mt = mdot_b[b] / nsub
+            dmd = (mt - mdot_prev[b]) * sr     # d(mdot)/dt  (kg/s^2)
+            mdot_prev[b] = mt
+            j = gi + int(rad[b, 0])            # direct path
+            if j >= gnd_n:
+                j -= gnd_n
+            gnd[j] += dmd * rad[b, 1]
+            j = gi + int(rad[b, 2])            # ground-image path
+            if j >= gnd_n:
+                j -= gnd_n
+            gnd[j] += dmd * rad[b, 3]
+        raw = gnd[gi]
+        gnd[gi] = 0.0
+        gi += 1
+        if gi >= gnd_n:
+            gi = 0
+        filt[22] = gi
         # DC blocker (removes the static offset/thump)
         hp = raw - filt[0] + 0.999 * filt[1]
         filt[0] = raw

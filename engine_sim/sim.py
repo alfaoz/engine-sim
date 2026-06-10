@@ -605,11 +605,18 @@ class EngineSim:
         # body/thump resonator (4,5); induction DC block (6,7), de-hash LPF (8,9);
         # peak-limiter envelope (10) + gain (11); combustion-clatter resonators
         # (12,13) and (14,15); knock ping (16,17); muffler chamber LP (18);
-        # clatter impact envelope (19); prev exhaust/intake mdot for the
-        # radiation-tap derivative (20, 21); ground-image ring index (22)
+        # clatter impact envelope (19); 20 unused (per-bank exhaust mdot
+        # state lives in mdot_prev); prev intake mdot for the induction
+        # derivative (21); radiation delay-ring write index (22)
         self.filt = np.zeros(24)
-        # ground-reflection delay line (max image delay ~83 samples @ 0.25 m)
-        self.gnd = np.zeros(128)
+        # shared multi-tap radiation delay ring: every tailpipe's direct ray
+        # and ground-image ray writes at its path delay (max ~90 samples at
+        # the 0.25 m minimum mic distance with the widest pipe offset)
+        self.gnd = np.zeros(256)
+        # per-bank radiation paths [direct delay, direct gain, image delay,
+        # image gain] + per-bank previous exit mdot (derivative state)
+        self.rad = np.zeros((nbanks, 4))
+        self.mdot_prev = np.zeros(nbanks)
         self._apply_radiation()
         self.filt[11] = 1.0          # limiter gain starts at unity
         self.P[core.P_MAP] = PATM
@@ -678,11 +685,26 @@ class EngineSim:
         return 1.0 / (4.0 * math.pi * r * P_FULLSCALE)
 
     def _apply_radiation(self):
-        """Set output gain + ground-image delay/ratio from the geometry."""
-        r, r_img = self._radiation_geom()
+        """Per-bank radiation paths from the listener geometry. Each bank's
+        tailpipe sits at its own lateral offset (dual exits flank the rear
+        of the car ~0.8 m apart; more pipes spread across the same span; a
+        single pipe is on the centreline = the old geometry exactly). Every
+        pipe gets a direct ray and a ground-image ray: gain = r_ref/r_path,
+        delay = path difference vs the centreline reference that defines
+        outgain."""
+        r, _ = self._radiation_geom()
         self.P[core.P_OUTGAIN] = 1.0 / (4.0 * math.pi * r * P_FULLSCALE)
-        self.P[core.P_GND_A] = r / r_img
-        self.P[core.P_GND_D] = round((r_img - r) / C_AIR * SAMPLE_RATE)
+        d = self.mic_r if self.mic_r > 0.25 else 0.25
+        nb = self.nbanks
+        span = 0.8 if nb > 1 else 0.0      # typical dual-exit spacing (m)
+        for b in range(nb):
+            y = (b - 0.5 * (nb - 1)) * (span / max(nb - 1, 1))
+            r_dir = math.sqrt(d * d + y * y + (H_EAR - H_SRC) ** 2)
+            r_img = math.sqrt(d * d + y * y + (H_EAR + H_SRC) ** 2)
+            self.rad[b, 0] = round((r_dir - r) / C_AIR * SAMPLE_RATE)
+            self.rad[b, 1] = r / r_dir
+            self.rad[b, 2] = round((r_img - r) / C_AIR * SAMPLE_RATE)
+            self.rad[b, 3] = r / r_img
 
     def set_mic_distance(self, r):
         self.mic_r = float(np.clip(r, 0.25, 20.0))
@@ -1128,6 +1150,7 @@ class EngineSim:
                                self.rho_r, self.mom_r, self.Ene_r,
                                self.src_rm, self.src_re,
                                out, self.scope_p, N_SCOPE, self.filt, self.gnd,
+                               self.rad, self.mdot_prev,
                                self.ex_area, self.ex_aface, self.ex_wk,
                                self.in_area, self.in_aface, self.in_wk,
                                self.run_area_a, self.run_aface, self.run_wk,
