@@ -1067,7 +1067,20 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                                    * (Pc / 101325.0) ** (-1.7) * np.exp(3800.0 / Tu))
                             cyl_knk[c, 2] += dt / tau
                             if cyl_knk[c, 2] >= 1.0:
-                                unburned = 1.0 - wiebe(f_now, wa, wm)
+                                # unburned fraction. f_now was WRAPPED for
+                                # pre-spark angles (it reads as "burn done"),
+                                # which silently suppressed PRE-IGNITION: a
+                                # 1-RON charge that auto-ignites during
+                                # compression must detonate in FULL, not wait
+                                # politely for the spark window (where the
+                                # release lands near TDC = a perfect Otto
+                                # burn -- the bug made awful fuel run BETTER).
+                                # cyl_chem[c,3] is the combusted-this-cycle
+                                # flag: clear = nothing has burned yet.
+                                if cyl_chem[c, 3] < 0.5:
+                                    unburned = 1.0
+                                else:
+                                    unburned = 1.0 - wiebe(f_now, wa, wm)
                                 if unburned > 0.05:
                                     ki = unburned * Pc * 1.0e-6   # ~MPa of end gas
                                     knock_acc += ki
