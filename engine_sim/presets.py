@@ -826,7 +826,7 @@ def _radial_9():
         # bark over the low rumble (the muffled single-collector default turned a
         # 17 L roar into a thin mid-heavy drone).
         pipe_length=0.6, pipe_diameter=0.065, runner_spread=0.30,
-        muffler_volume=-1.0, exhaust_banks=3,
+        muffler_volume=-0.001, exhaust_banks=3,  # <0 = straight (UI shows -1 L)
         # single-row radial fires every other cylinder -> even 80deg cadence
         firing_order=[1, 3, 5, 7, 9, 2, 4, 6, 8],
     )
