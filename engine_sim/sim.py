@@ -426,7 +426,34 @@ class EngineSim:
             P[core.P_HT] = 1.15      # higher wall loss (cooler walls, CI mixing)
         P[core.P_WALLT] = self.T_metal      # wall temp tracks the metal (thermal model)
         P[core.P_DIESEL] = 1.0 if cfg.diesel else 0.0
-        P[core.P_DAMP] = 0.0015
+        # exhaust wall loss is now the visco-thermal model (below); the flat
+        # per-substep damp is a manual extra, default OFF (UI "exh damping")
+        P[core.P_DAMP] = 0.0
+        # ---- Kirchhoff visco-thermal boundary-layer loss (exhaust) ----
+        # alpha(f) = sqrt(pi f nu)/(r c) * (1 + (g-1)/sqrt(Pr)) Np/m at hot
+        # exhaust-gas conditions (Sutherland viscosity at ~700 K). The 1D
+        # solver realizes it as a one-pole high-shelf momentum loss with
+        # per-cell rate K/sqrt(A); K and the corner fc are set by matching
+        # the shelf to alpha(f)*c at the pipe's own quarter-wave fundamental
+        # f0 = c/4L and at 4 kHz (algebra below, no free constants):
+        #   loss(f) = k f^2/(f^2+fc^2);  loss(f0) = a0,  loss(F) = a0*sqrt(F/f0)
+        #   => fc^2 = f0^2 F^2 (R-1)/(F^2 - R f0^2),  R = sqrt(F/f0)
+        T_vt = 700.0
+        mu_vt = (1.716e-5 * (T_vt / 273.15) ** 1.5
+                 * (273.15 + 110.4) / (T_vt + 110.4))
+        c_vt = math.sqrt(GAMMA_EX * R_AIR * T_vt)
+        nu_vt = mu_vt * R_AIR * T_vt / PATM            # mu / rho
+        r_vt = math.sqrt(pipe_area / math.pi)
+        f0_vt = c_vt / (4.0 * cfg.pipe_length)
+        F_vt = 4000.0
+        a0_vt = (math.sqrt(math.pi * f0_vt * nu_vt) / (r_vt * c_vt)
+                 * (1.0 + (GAMMA_EX - 1.0) / math.sqrt(0.72))) * c_vt
+        R_vt = math.sqrt(F_vt / f0_vt)
+        fc2_vt = (f0_vt ** 2 * F_vt ** 2 * (R_vt - 1.0)
+                  / (F_vt ** 2 - R_vt * f0_vt ** 2))
+        k_vt = a0_vt * (f0_vt ** 2 + fc2_vt) / f0_vt ** 2
+        P[core.P_VTK] = k_vt * math.sqrt(pipe_area)    # rate = K/sqrt(A_cell)
+        P[core.P_VTW] = 2.0 * math.pi * math.sqrt(fc2_vt)
         P[core.P_OUTGAIN] = self.out_gain()
         P[core.P_REDLINE] = cfg.redline_rpm
         P[core.P_RUNNING] = 0.0     # engine starts off — user cranks it
@@ -617,6 +644,8 @@ class EngineSim:
         # image gain] + per-bank previous exit mdot (derivative state)
         self.rad = np.zeros((nbanks, 4))
         self.mdot_prev = np.zeros(nbanks)
+        # visco-thermal shelf state: slow momentum average per exhaust cell
+        self.vt_ex = np.zeros((nbanks, N))
         self._apply_radiation()
         self.filt[11] = 1.0          # limiter gain starts at unity
         self.P[core.P_MAP] = PATM
@@ -1150,7 +1179,7 @@ class EngineSim:
                                self.rho_r, self.mom_r, self.Ene_r,
                                self.src_rm, self.src_re,
                                out, self.scope_p, N_SCOPE, self.filt, self.gnd,
-                               self.rad, self.mdot_prev,
+                               self.rad, self.mdot_prev, self.vt_ex,
                                self.ex_area, self.ex_aface, self.ex_wk,
                                self.in_area, self.in_aface, self.in_wk,
                                self.run_area_a, self.run_aface, self.run_wk,

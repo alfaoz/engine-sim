@@ -161,8 +161,10 @@ P_GND_D       = 107 # (legacy, unused: per-bank delays live in the rad table)
 P_GND_A       = 108 # (legacy, unused: per-bank gains live in the rad table)
 
 P_FUELUSED    = 109 # (out) fuel mass injected this block (kg)
+P_VTK         = 110 # visco-thermal loss K ((1/s)*m): rate = K/sqrt(A_cell)
+P_VTW         = 111 # visco-thermal shelf corner (rad/s): 2*pi*fc
 
-P_NPARAMS     = 110
+P_NPARAMS     = 112
 
 # --- state vector layout (st) ---
 S_THETA       = 0   # crank angle (rad)
@@ -340,7 +342,8 @@ def _hllc(rL, uL, pL, rR, uR, pR, g):
 
 @njit(cache=True, fastmath=True)
 def gas_step_q(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open,
-               damp, pack, src_m, src_E, area, aface, wk, bnd):
+               damp, pack, src_m, src_E, area, aface, wk, bnd,
+               vt_lp, vt_K, vt_w):
     """One MUSCL-Hancock step of the QUASI-1D Euler equations (variable area
     A(x)) with an HLLC flux. Second-order in space (minmod-limited primitive
     reconstruction) and time (Hancock half-step predictor). Replaces the old
@@ -490,6 +493,27 @@ def gas_step_q(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open,
         # packing (pack[i] is nonzero only in silencer-chamber cells: a
         # glass-pack eats the coherent ring a purely reflective chamber keeps)
         mom[i] -= (damp + pack[i]) * mom[i]
+        # visco-thermal boundary-layer loss (Kirchhoff): alpha(f) =
+        # sqrt(pi f nu)/(r c) * (1 + (g-1)/sqrt(Pr)) Np/m -- wall loss grows
+        # ~sqrt(f) and shrinks with duct radius. Realized as a one-pole high
+        # shelf on the momentum's deviation from its slow average (zero loss
+        # at DC: mean flow untouched, Darcy owns that), with rate K/sqrt(A)
+        # carrying the 1/r dependence per cell (a fat chamber loses less per
+        # metre than the header). K and the corner are matched to alpha*c at
+        # the pipe's own quarter-wave fundamental and at 4 kHz (sim._build).
+        # This REPLACES the frequency-flat exhaust damp, which had the
+        # physics backwards: it pinned the fundamental at Q~4 while letting
+        # the midband ring at Q~100.
+        if vt_K > 0.0:
+            av = vt_w * dt
+            if av > 1.0:
+                av = 1.0
+            lpv = vt_lp[i] + av * (mom[i] - vt_lp[i])
+            vt_lp[i] = lpv
+            fv = vt_K / np.sqrt(area[i]) * dt
+            if fv > 0.5:
+                fv = 0.5
+            mom[i] -= fv * (mom[i] - lpv)
         # ---- robust clamps (also catch any non-finite value) ----
         ri = rho[i]
         if not (ri == ri) or ri < 1e-4:
@@ -522,6 +546,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                    run_mdot, fresh, cyl_knk, cyl_chem, pipe_chem,
                    rho_r, mom_r, Ene_r, src_rm, src_re,
                    out_audio, scope_p, n_scope, filt, gnd, rad, mdot_prev,
+                   vt_ex,
                    pa_ex, fa_ex, wk_ex,
                    pa_in, fa_in, wk_in,
                    pa_run, fa_run, wk_run,
@@ -639,6 +664,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     # low end and a natural comb in the mids, i.e. an outdoor car instead of
     # a source floating in a void.
     gnd_n = gnd.shape[0]   # multi-tap radiation delay ring (all paths share it)
+    vt_K = P[P_VTK]        # visco-thermal wall-loss rate K ((1/s)*m)
+    vt_w = P[P_VTW]        # visco-thermal shelf corner (rad/s)
     redline = P[P_REDLINE]
     running = P[P_RUNNING] > 0.5
     starter = P[P_STARTER]
@@ -1370,7 +1397,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             for b in range(nbanks):
                 gas_step_q(rho[b], mom[b], Ene[b], N, dx, dt_gas, gex, Rex,
                            patm, Tatm, patm, Tatm, damp, pk_ex, src_m[b],
-                           src_E[b], pa_ex, fa_ex, wk_ex, bnd_ex[b])
+                           src_E[b], pa_ex, fa_ex, wk_ex, bnd_ex[b],
+                           vt_ex[b], vt_K, vt_w)
             # sources are an impulse for the whole sample; apply only once
             for b in range(nbanks):
                 for k in range(N):
@@ -1445,7 +1473,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 for _ in range(nsub_r):
                     gas_step_q(rrho, rmom, rEne, Nr, dx_r, dt_gas_r, g, R,
                                patm, Tatm, MAP, Tman, damp_in, pk_run, srm,
-                               sre, pa_run, fa_run, wk_run, bnd_run[c])
+                               sre, pa_run, fa_run, wk_run, bnd_run[c],
+                               pk_run, 0.0, 0.0)
                     srm[0] = 0.0
                     sre[0] = 0.0
 
@@ -1470,7 +1499,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             for _ in range(nsub_in):
                 gas_step_q(rho_in, mom_in, Ene_in, Ni, dx_in, dt_gas_in, g, R,
                            patm, Tatm, Pboost, Tman, damp_in, pk_in, src_in_m,
-                           src_in_E, pa_in, fa_in, wk_in, bnd_in)
+                           src_in_E, pa_in, fa_in, wk_in, bnd_in,
+                           pk_in, 0.0, 0.0)
                 mdot_in_acc += mom_in[Ni - 1] * fa_in[Ni]   # mouth mass flow
 
         # ---- turbocharger shaft dynamics ----

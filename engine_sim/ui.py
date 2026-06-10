@@ -803,7 +803,7 @@ class EngineUI:
                                 dpg.add_text("   Tuning:", color=(170, 170, 170))
                                 self._num("micdist", "mic dist (m)", 2.0, 0.5, 10.0,
                                           live=True)
-                                self._num("damp", "exh damping", 0.0015, 0.0, 0.02,
+                                self._num("damp", "exh damping", 0.0, 0.0, 0.02,
                                           live=True)
                                 dpg.add_slider_float(tag="backfire",
                                                      label="crackle",

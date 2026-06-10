@@ -94,7 +94,7 @@ def run(N=200, tau=0.2):
             dt = t_end - t
         gas_step_q(rho, mom, Ene, N, dx, dt, G, R, 0.1 * alpha, T_open,
                    0.1 * alpha, T_open, 0.0, np.zeros(N), src_m, src_E,
-                   area, aface, wk, np.zeros(2))
+                   area, aface, wk, np.zeros(2), np.zeros(N), 0.0, 0.0)
         t += dt
 
     u = mom / rho / sa                                # back to nondim velocity
