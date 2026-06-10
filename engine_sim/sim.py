@@ -743,9 +743,11 @@ class EngineSim:
         # absorptive muffler packing: per-cell damping only inside silencer
         # shells. A glass-pack absorbs ~50-90% of a wave per pass; sized
         # from dwell (~180 CFL substeps in a chamber): 0.006/substep ~ 2/3
-        # per pass. Not for straight pipes / 2-stroke chambers (they ring).
+        # per pass. Not for straight pipes or the 2-stroke chamber itself
+        # (those ring by design); the profile records which spans are
+        # packed (4T shells, or the 2T stinger CAN).
         self.pk_ex = np.zeros(N)
-        if cfg.stroke_cycle == 4 and not self._straight_eff():
+        if self._pack_spans:
             xc_pk = (np.arange(N) + 0.5) / N
             for lo, hi in self._pack_spans:
                 self.pk_ex[(xc_pk >= lo) & (xc_pk <= hi)] = 0.006
@@ -803,8 +805,23 @@ class EngineSim:
             # scavenging resonance; the tiny stinger sets back-pressure.
             belly = pipe_area * 6.0
             stinger = pipe_area * 0.42
-            xs = [0.0, 0.12, 0.45, 0.58, 0.86, 1.0]
-            ars = [pipe_area, pipe_area, belly, belly, stinger, stinger]
+            if cfg.muffler_volume >= 0.0 and self.mix_muffler:
+                # stinger SILENCER: the small packed can every road 2-stroke
+                # hangs on the chamber's tail (race pipes with
+                # muffler_volume<0 stay raw). The chamber's tuning geometry
+                # (cones/belly positions) is untouched; only the bare
+                # stinger tube gains a 2.5x packed can before the outlet --
+                # it is what turns the raw chamber "honk" into the street
+                # "braap". Toggleable via the Sound-lab Muffler checkbox.
+                can = pipe_area * 2.5
+                xs = [0.0, 0.12, 0.45, 0.58, 0.84, 0.86,
+                      0.88, 0.96, 0.98, 1.0]
+                ars = [pipe_area, pipe_area, belly, belly, stinger, stinger,
+                       can, can, stinger, stinger]
+                self._pack_spans = [(0.86, 0.98)]
+            else:
+                xs = [0.0, 0.12, 0.45, 0.58, 0.86, 1.0]
+                ars = [pipe_area, pipe_area, belly, belly, stinger, stinger]
         elif self._straight_eff():
             # open / straight pipe: a mild collector step then constant bore
             # (raw quarter-wave resonator, bright and loud -- no silencing)
