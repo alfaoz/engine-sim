@@ -820,7 +820,13 @@ def _radial_9():
         compression_ratio=6.5, n_cylinders=9, stroke_cycle=4,
         ignition_btdc=25.0, burn_duration=52.0,
         redline_rpm=2400.0, idle_rpm=550.0, inertia=4.0,
-        pipe_length=1.0, pipe_diameter=0.075, runner_spread=0.30,
+        # Open short stacks, no silencer -- a radial is deafening and barks. True
+        # per-cylinder stacks (9 pipes) would be most faithful but blow the
+        # real-time budget; 3 collector banks of 3 cylinders give the firing-rate
+        # bark over the low rumble (the muffled single-collector default turned a
+        # 17 L roar into a thin mid-heavy drone).
+        pipe_length=0.6, pipe_diameter=0.065, runner_spread=0.30,
+        muffler_volume=-0.001, exhaust_banks=3,  # <0 = straight (UI shows -1 L)
         # single-row radial fires every other cylinder -> even 80deg cadence
         firing_order=[1, 3, 5, 7, 9, 2, 4, 6, 8],
     )

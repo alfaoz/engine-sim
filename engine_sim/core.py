@@ -3,8 +3,9 @@ Real-time engine core: crank kinematics + 0D filling/emptying cylinder
 thermodynamics + 1D compressible (Euler) exhaust gas dynamics.
 
 Everything in the hot path is numba-njit compiled so a whole audio block can be
-advanced sample-by-sample at 48 kHz in real time. The pressure wave arriving at
-the open (tailpipe) end of the 1D exhaust IS the audio signal.
+advanced sample-by-sample at 48 kHz in real time. The audio signal is the
+monopole radiation of the tailpipe orifice: d(mdot_exit)/dt / (4*pi*r) at a
+listener r metres away (and the same for the intake mouth).
 
 State layout
 ------------
@@ -153,7 +154,19 @@ P_TYRESLIP    = 104 # 1 = slip-ratio tyre + wheel DOF, 0 = rigid grip cap (dyno)
 
 P_NBANKS      = 105 # number of separate exhaust banks (V/W engines -> 2+)
 
-P_NPARAMS     = 106
+P_AFTERFIRE   = 106 # rich-running afterfire intensity (over-fuel flames/pops)
+
+# --- ground-reflection image source (the "room": mic stands over asphalt) ---
+P_GND_D       = 107 # (legacy, unused: per-bank delays live in the rad table)
+P_GND_A       = 108 # (legacy, unused: per-bank gains live in the rad table)
+
+P_FUELUSED    = 109 # (out) fuel mass injected this block (kg)
+P_VTK         = 110 # visco-thermal loss K ((1/s)*m): rate = K/sqrt(A_cell)
+P_VTW         = 111 # visco-thermal shelf corner (rad/s): 2*pi*fc
+P_PORTV       = 112 # per-cylinder exhaust port+primary volume (m^3); 0 = off
+P_PORTA       = 113 # exhaust primary-runner flow area (m^2)
+
+P_NPARAMS     = 114
 
 # --- state vector layout (st) ---
 S_THETA       = 0   # crank angle (rad)
@@ -228,6 +241,30 @@ def wiebe(frac, a, m):
 
 
 @njit(cache=True, fastmath=True, inline='always')
+def _u_of_T(T, cv0, b):
+    """Specific internal energy with a temperature-dependent heat capacity
+    cv(T)=cv0+b*T (so gamma drops as the charge heats, ~1.40 cold air -> ~1.29
+    hot combustion products). u = integral of cv dT from 0 K = (cv0+0.5 b T) T."""
+    return (cv0 + 0.5 * b * T) * T
+
+
+@njit(cache=True, fastmath=True, inline='always')
+def _h_of_T(T, cv0, b, R):
+    """Specific enthalpy h = u + R*T for the same cv(T) model (for the valve
+    enthalpy transport: hotter gas carries more energy per kg than a fixed cp)."""
+    return (cv0 + 0.5 * b * T + R) * T
+
+
+@njit(cache=True, fastmath=True, inline='always')
+def _T_of_u(u, cv0, b):
+    """Invert u(T) (a quadratic in T) for the new temperature after the energy
+    balance -- closed form, no iteration: 0.5 b T^2 + cv0 T - u = 0."""
+    if u < 0.0:
+        u = 0.0
+    return (-cv0 + np.sqrt(cv0 * cv0 + 2.0 * b * u)) / b
+
+
+@njit(cache=True, fastmath=True, inline='always')
 def orifice_mdot(p_up, T_up, p_down, area, Cd, g, R):
     """Compressible mass flow (kg/s) through a restriction, upstream -> downstream.
     Returns positive magnitude; caller assigns direction."""
@@ -245,81 +282,243 @@ def orifice_mdot(p_up, T_up, p_down, area, Cd, g, R):
     return Cd * area * p_up / np.sqrt(R * T_up) * np.sqrt(term)
 
 
-@njit(cache=True, fastmath=True)
-def gas_step(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open, damp,
-             src_m, src_E, cell_vol):
-    """One explicit finite-volume (Rusanov) step of the 1D Euler equations
-    with a reflecting head wall (cell 0) and an open tail (cell N-1) that
-    radiates into a reservoir at p_open/T_open (atmosphere for the exhaust
-    tailpipe, the boost/airbox pressure for the intake mouth). src_m / src_E
-    are per-cell mass (kg) / energy (J) sources for this step; they are
-    converted to densities by the cell volume before being applied."""
-    rho_atm = patm / (R * Tatm)
-    E_atm = patm / (g - 1.0)
-    rho_open = p_open / (R * T_open)
+@njit(cache=True, fastmath=True, inline='always')
+def _minmod(a, b):
+    """Minmod slope limiter: returns the smaller-magnitude argument if they
+    share a sign, else 0. This is what keeps the 2nd-order reconstruction from
+    overshooting (Gibbs ringing) across the sharp blowdown fronts."""
+    if a * b <= 0.0:
+        return 0.0
+    return a if abs(a) < abs(b) else b
 
-    # apply cylinder sources first (mass/energy -> density via cell volume)
+
+@njit(cache=True, fastmath=True, inline='always')
+def _hllc(rL, uL, pL, rR, uR, pR, g):
+    """HLLC approximate Riemann solver (Toro). Returns the interface flux
+    (Fmass, Fmom, Fene). Unlike Rusanov/local-Lax-Friedrichs it carries the
+    contact wave, so the hot-gas slug from blowdown stays a sharp front instead
+    of being smeared over a dozen cells -- which is exactly the wave action that
+    voices the exhaust. Constant gamma g (combustion products ~ fixed comp)."""
+    aL = np.sqrt(g * pL / rL)
+    aR = np.sqrt(g * pR / rR)
+    EL = pL / (g - 1.0) + 0.5 * rL * uL * uL
+    ER = pR / (g - 1.0) + 0.5 * rR * uR * uR
+    # Davis/Einfeldt wave-speed estimates (robust, positively conservative)
+    SL = uL - aL
+    sr_ = uR - aR
+    if sr_ < SL:
+        SL = sr_
+    SR = uR + aR
+    sl_ = uL + aL
+    if sl_ > SR:
+        SR = sl_
+    if SL >= 0.0:
+        return rL * uL, rL * uL * uL + pL, (EL + pL) * uL
+    if SR <= 0.0:
+        return rR * uR, rR * uR * uR + pR, (ER + pR) * uR
+    # contact (star) wave speed
+    denom = rL * (SL - uL) - rR * (SR - uR)
+    Sstar = (pR - pL + rL * uL * (SL - uL) - rR * uR * (SR - uR)) / denom
+    if Sstar >= 0.0:
+        F0 = rL * uL
+        F1 = rL * uL * uL + pL
+        F2 = (EL + pL) * uL
+        fac = rL * (SL - uL) / (SL - Sstar)
+        U0 = fac
+        U1 = fac * Sstar
+        U2 = fac * (EL / rL + (Sstar - uL) * (Sstar + pL / (rL * (SL - uL))))
+        return (F0 + SL * (U0 - rL),
+                F1 + SL * (U1 - rL * uL),
+                F2 + SL * (U2 - EL))
+    F0 = rR * uR
+    F1 = rR * uR * uR + pR
+    F2 = (ER + pR) * uR
+    fac = rR * (SR - uR) / (SR - Sstar)
+    U0 = fac
+    U1 = fac * Sstar
+    U2 = fac * (ER / rR + (Sstar - uR) * (Sstar + pR / (rR * (SR - uR))))
+    return (F0 + SR * (U0 - rR),
+            F1 + SR * (U1 - rR * uR),
+            F2 + SR * (U2 - ER))
+
+
+@njit(cache=True, fastmath=True)
+def gas_step_q(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open,
+               damp, pack, src_m, src_E, area, aface, wk, bnd,
+               vt_lp, vt_K, vt_w):
+    """One MUSCL-Hancock step of the QUASI-1D Euler equations (variable area
+    A(x)) with an HLLC flux. Second-order in space (minmod-limited primitive
+    reconstruction) and time (Hancock half-step predictor). Replaces the old
+    first-order Rusanov gas_step: far less numerical diffusion, so real
+    quarter-wave tuning, collector cross-talk and silencer transmission loss
+    emerge from the geometry instead of being faked with output filters.
+
+    area[i]  : cross-sectional area of cell i (m^2)   -- header/collector/muffler
+    aface[k] : area at face k (N+1 faces); momentum sees a p*dA/dx wall force
+    wk       : (>=15, N) scratch (primitives, slopes, evolved L/R, dU accumulators)
+
+    Reflecting head wall at face 0; tail face N is a physical open end into a
+    reservoir at p_open/T_open (atmosphere for the tailpipe, boost/airbox for
+    an intake mouth): long waves reflect, short waves radiate out -- see the
+    tail-boundary block. bnd (2,) persists that boundary's filter state.
+    """
+    rho_open = p_open / (R * T_open)
+    E_atm = patm / (g - 1.0)
+    rho_atm = patm / (R * Tatm)
+
+    # ---- cylinder / port sources (mass kg, energy J) -> densities via cell vol
     for i in range(N):
         if src_m[i] != 0.0 or src_E[i] != 0.0:
-            rho[i] += src_m[i] / cell_vol
-            Ene[i] += src_E[i] / cell_vol
+            vol = area[i] * dx
+            rho[i] += src_m[i] / vol
+            Ene[i] += src_E[i] / vol
             if rho[i] < 1e-6:
                 rho[i] = 1e-6
 
-    # primitive vars
-    u = np.empty(N)
-    p = np.empty(N)
-    a = np.empty(N)
+    r = wk[0]; u = wk[1]; p = wk[2]
+    sr = wk[3]; su = wk[4]; sp = wk[5]
+    rLs = wk[6]; uLs = wk[7]; pLs = wk[8]
+    rRs = wk[9]; uRs = wk[10]; pRs = wk[11]
+    # dU accumulators reuse the preallocated scratch (rows 12-14) -- allocating
+    # these per call would be ~12k mallocs per audio block and stall the callback
+    # (periodic dropouts). They are zeroed in the primitive loop below.
+    d0 = wk[12]; d1 = wk[13]; d2 = wk[14]
+
     for i in range(N):
         ui = mom[i] / rho[i]
         pi = (g - 1.0) * (Ene[i] - 0.5 * rho[i] * ui * ui)
         if pi < 1.0:
             pi = 1.0
-        u[i] = ui
-        p[i] = pi
-        a[i] = np.sqrt(g * pi / rho[i])
+        r[i] = rho[i]; u[i] = ui; p[i] = pi
+        d0[i] = 0.0; d1[i] = 0.0; d2[i] = 0.0
 
-    # fluxes at interfaces 0..N (N+1 faces); use ghost cells for BCs
-    fr = np.empty(N + 1)
-    fm = np.empty(N + 1)
-    fe = np.empty(N + 1)
-    for f in range(N + 1):
-        # left/right states
-        if f == 0:
-            # reflecting head wall: ghost = mirror of cell 0 with -u
-            rL = rho[0]; uL = -u[0]; pL = p[0]; aL = a[0]
-            rR = rho[0]; uR = u[0]; pR = p[0]; aR = a[0]
-        elif f == N:
-            # open tail: ghost held at the reservoir pressure (radiating)
-            rL = rho[N - 1]; uL = u[N - 1]; pL = p[N - 1]; aL = a[N - 1]
-            rR = rho_open; uR = u[N - 1]; pR = p_open
-            aR = np.sqrt(g * pR / rR)
-        else:
-            rL = rho[f - 1]; uL = u[f - 1]; pL = p[f - 1]; aL = a[f - 1]
-            rR = rho[f];     uR = u[f];     pR = p[f];     aR = a[f]
+    # ---- minmod-limited primitive slopes (zero at the two boundary cells) ----
+    sr[0] = 0.0; su[0] = 0.0; sp[0] = 0.0
+    sr[N - 1] = 0.0; su[N - 1] = 0.0; sp[N - 1] = 0.0
+    for i in range(1, N - 1):
+        sr[i] = _minmod(r[i] - r[i - 1], r[i + 1] - r[i])
+        su[i] = _minmod(u[i] - u[i - 1], u[i + 1] - u[i])
+        sp[i] = _minmod(p[i] - p[i - 1], p[i + 1] - p[i])
 
-        EL = pL / (g - 1.0) + 0.5 * rL * uL * uL
-        ER = pR / (g - 1.0) + 0.5 * rR * uR * uR
-        # physical fluxes
-        FrL = rL * uL;            FrR = rR * uR
-        FmL = rL * uL * uL + pL;  FmR = rR * uR * uR + pR
-        FeL = (EL + pL) * uL;     FeR = (ER + pR) * uR
-        smax = max(abs(uL) + aL, abs(uR) + aR)
-        fr[f] = 0.5 * (FrL + FrR) - 0.5 * smax * (rR - rL)
-        fm[f] = 0.5 * (FmL + FmR) - 0.5 * smax * (rR * uR - rL * uL)
-        fe[f] = 0.5 * (FeL + FeR) - 0.5 * smax * (ER - EL)
-
-    # update
-    lam = dt / dx
+    # ---- Hancock predictor: reconstruct to faces, evolve cell by dt/2 ----
+    hf = 0.5 * dt / dx
     for i in range(N):
-        rho[i] += -lam * (fr[i + 1] - fr[i])
-        mom[i] += -lam * (fm[i + 1] - fm[i])
-        Ene[i] += -lam * (fe[i + 1] - fe[i])
-        # gentle wall damping toward rest (acoustic/viscous losses)
-        mom[i] -= damp * mom[i]
-        # --- robust clamps (also catch any non-finite value) ---
+        rl = r[i] - 0.5 * sr[i]; ul = u[i] - 0.5 * su[i]; pl = p[i] - 0.5 * sp[i]
+        rr = r[i] + 0.5 * sr[i]; ur = u[i] + 0.5 * su[i]; pr = p[i] + 0.5 * sp[i]
+        if rl < 1e-6: rl = 1e-6
+        if rr < 1e-6: rr = 1e-6
+        if pl < 1.0: pl = 1.0
+        if pr < 1.0: pr = 1.0
+        # conservative + physical flux at each face value
+        EL = pl / (g - 1.0) + 0.5 * rl * ul * ul
+        ER = pr / (g - 1.0) + 0.5 * rr * ur * ur
+        FL0 = rl * ul; FL1 = rl * ul * ul + pl; FL2 = (EL + pl) * ul
+        FR0 = rr * ur; FR1 = rr * ur * ur + pr; FR2 = (ER + pr) * ur
+        # ΔU = (dt/2/dx)*(F_left - F_right), applied to BOTH interface states
+        e0 = hf * (FL0 - FR0); e1 = hf * (FL1 - FR1); e2 = hf * (FL2 - FR2)
+        UL0 = rl + e0; UL1 = rl * ul + e1; UL2 = EL + e2
+        UR0 = rr + e0; UR1 = rr * ur + e1; UR2 = ER + e2
+        if UL0 < 1e-6: UL0 = 1e-6
+        if UR0 < 1e-6: UR0 = 1e-6
+        uli = UL1 / UL0; uri = UR1 / UR0
+        pli = (g - 1.0) * (UL2 - 0.5 * UL0 * uli * uli)
+        pri = (g - 1.0) * (UR2 - 0.5 * UR0 * uri * uri)
+        if pli < 1.0: pli = 1.0
+        if pri < 1.0: pri = 1.0
+        rLs[i] = UL0; uLs[i] = uli; pLs[i] = pli   # cell i's LEFT-face state
+        rRs[i] = UR0; uRs[i] = uri; pRs[i] = pri   # cell i's RIGHT-face state
+
+    # ---- face fluxes (HLLC) and quasi-1D conservative update ----
+    # interior faces 1..N-1: between cell f-1 (right state) and cell f (left)
+    for f in range(1, N):
+        af = aface[f]
+        F0, F1, F2 = _hllc(rRs[f - 1], uRs[f - 1], pRs[f - 1],
+                           rLs[f], uLs[f], pLs[f], g)
+        F0 *= af; F1 *= af; F2 *= af
+        d0[f - 1] -= F0; d1[f - 1] -= F1; d2[f - 1] -= F2
+        d0[f] += F0; d1[f] += F1; d2[f] += F2
+    # head wall (face 0): reflecting -> mirror cell 0's left state with -u
+    af0 = aface[0]
+    F0, F1, F2 = _hllc(rLs[0], -uLs[0], pLs[0], rLs[0], uLs[0], pLs[0], g)
+    d0[0] += F0 * af0; d1[0] += F1 * af0; d2[0] += F2 * af0
+    # tail (face N): PHYSICAL open end (Levine-Schwinger behaviour). An
+    # unflanged pipe end reflects long waves (ka<<1: pressure release, the
+    # organ-pipe tuning and the exhaust's low-end body) and radiates short
+    # waves away (ka>>1: no reflection -- so high frequencies leave instead of
+    # ringing as a trapped comb). The split is a one-pole on the boundary
+    # deviation with corner ka=1 -> f_c = c/(2*pi*a_exit): set ONLY by the
+    # exit radius and the local sound speed, no tunable reflection constant.
+    # bnd[0]/bnd[1] persist the slow (reflected) parts of (p - p_open) and
+    # (rho - rho_open) between calls; the fast remainder passes out.
+    afN = aface[N]
+    pin_ = pRs[N - 1]
+    rin_ = rRs[N - 1]
+    c_loc = np.sqrt(g * pin_ / rin_)
+    a_exit = np.sqrt(afN / np.pi)
+    alpha_b = 1.0 - np.exp(-c_loc / a_exit * dt)
+    bnd[0] += alpha_b * ((pin_ - p_open) - bnd[0])
+    bnd[1] += alpha_b * ((rin_ - rho_open) - bnd[1])
+    p_g = pin_ - bnd[0]
+    rho_g = rin_ - bnd[1]
+    if p_g < 1.0:
+        p_g = 1.0
+    if rho_g < 1e-6:
+        rho_g = 1e-6
+    F0, F1, F2 = _hllc(rRs[N - 1], uRs[N - 1], pRs[N - 1],
+                       rho_g, uRs[N - 1], p_g, g)
+    d0[N - 1] -= F0 * afN; d1[N - 1] -= F1 * afN; d2[N - 1] -= F2 * afN
+
+    # ---- apply: dU = dt/Vol * (flux balance + p*dA momentum source) ----
+    for i in range(N):
+        vol = area[i] * dx
+        inv = dt / vol
+        rho[i] += inv * d0[i]
+        # quasi-1D pressure-on-walls force: p_i * (A_{i+1/2} - A_{i-1/2})
+        mom[i] += inv * (d1[i] + p[i] * (aface[i + 1] - aface[i]))
+        Ene[i] += inv * d2[i]
+        # turbulent wall friction (Darcy-Weisbach): dp/dx = f/D * rho u|u| / 2,
+        # f = 0.035 (Moody, smooth pipe, Re ~ 1e4-1e5), D from the local area.
+        # Quadratic in u: it bites on the loud wave fronts that ring the pipe's
+        # quarter-wave comb (the "plastic tube" coloration) and vanishes for
+        # small signals -- so it cannot kill the idle tone the way a stronger
+        # LINEAR loss would. Momentum sinks, Ene is untouched: the lost kinetic
+        # energy lands in heat automatically (Eint = Ene - kin). The flat damp
+        # below stays as the small-signal visco-thermal floor.
+        ui_ = mom[i] / rho[i]
+        if ui_ < 0.0:
+            ui_ = -ui_
+        fr = dt * 0.0155 / np.sqrt(area[i]) * ui_   # 0.035/(2*sqrt(4A/pi))
+        if fr > 0.5:
+            fr = 0.5
+        mom[i] -= fr * mom[i]
+        # gentle wall damping (acoustic/viscous losses) + absorptive muffler
+        # packing (pack[i] is nonzero only in silencer-chamber cells: a
+        # glass-pack eats the coherent ring a purely reflective chamber keeps)
+        mom[i] -= (damp + pack[i]) * mom[i]
+        # visco-thermal boundary-layer loss (Kirchhoff): alpha(f) =
+        # sqrt(pi f nu)/(r c) * (1 + (g-1)/sqrt(Pr)) Np/m -- wall loss grows
+        # ~sqrt(f) and shrinks with duct radius. Realized as a one-pole high
+        # shelf on the momentum's deviation from its slow average (zero loss
+        # at DC: mean flow untouched, Darcy owns that), with rate K/sqrt(A)
+        # carrying the 1/r dependence per cell (a fat chamber loses less per
+        # metre than the header). K and the corner are matched to alpha*c at
+        # the pipe's own quarter-wave fundamental and at 4 kHz (sim._build).
+        # This REPLACES the frequency-flat exhaust damp, which had the
+        # physics backwards: it pinned the fundamental at Q~4 while letting
+        # the midband ring at Q~100.
+        if vt_K > 0.0:
+            av = vt_w * dt
+            if av > 1.0:
+                av = 1.0
+            lpv = vt_lp[i] + av * (mom[i] - vt_lp[i])
+            vt_lp[i] = lpv
+            fv = vt_K / np.sqrt(area[i]) * dt
+            if fv > 0.5:
+                fv = 0.5
+            mom[i] -= fv * (mom[i] - lpv)
+        # ---- robust clamps (also catch any non-finite value) ----
         ri = rho[i]
-        if not (ri == ri) or ri < 1e-4:      # NaN or too low
+        if not (ri == ri) or ri < 1e-4:
             ri = 1e-4
         if ri > 30.0 * rho_atm:
             ri = 30.0 * rho_atm
@@ -327,7 +526,6 @@ def gas_step(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open, damp,
         mi = mom[i]
         if not (mi == mi):
             mi = 0.0
-        # cap velocity
         umax = 1200.0
         if mi > umax * ri:
             mi = umax * ri
@@ -338,8 +536,6 @@ def gas_step(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open, damp,
         Eint = Ene[i] - kin
         if not (Eint == Eint) or Eint < E_atm * 1e-3:
             Eint = E_atm * 1e-3
-        # bound temperature -> bounds sound speed -> keeps the explicit step
-        # stable through blowdown/backfire spikes
         T_i = (g - 1.0) * Eint / (ri * R)
         if T_i > 2800.0:
             Eint = ri * R * 2800.0 / (g - 1.0)
@@ -349,9 +545,15 @@ def gas_step(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open, damp,
 @njit(cache=True, fastmath=True)
 def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                    rho, mom, Ene, rho_in, mom_in, Ene_in,
-                   run_mdot, port_m, fresh, cyl_knk,
+                   run_mdot, fresh, cyl_knk, cyl_chem, pipe_chem,
                    rho_r, mom_r, Ene_r, src_rm, src_re,
-                   out_audio, scope_p, n_scope, filt):
+                   out_audio, scope_p, n_scope, filt, gnd, rad, mdot_prev,
+                   vt_ex, port_m, port_E,
+                   pa_ex, fa_ex, wk_ex,
+                   pa_in, fa_in, wk_in,
+                   pa_run, fa_run, wk_run,
+                   bnd_ex, bnd_in, bnd_run,
+                   pk_ex, pk_in, pk_run):
     """Advance the full engine by n_samples audio samples. Fills out_audio with
     the voiced tailpipe (exhaust) signal plus the intake-mouth induction signal,
     and records cylinder-0 pressure vs crank into scope_p for the UI. Returns
@@ -360,15 +562,25 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     Per-cylinder intake-runner ram (inertia tuning):
       run_mdot[c] : mass flow in cylinder c's intake runner (kg/s), a momentum
                     state -- the air column's inertia is what rams charge in.
-      port_m[c]   : gas mass in the runner port volume (kg) feeding the valve.
       fresh[c]    : fresh air mass inducted this cycle (kg); meters the fuel so
-                    the ram VE gain actually shows up as torque."""
+                    the ram VE gain actually shows up as torque.
+
+    ex_area/ex_aface (N / N+1) : exhaust pipe cross-section per cell / per face
+    (header -> collector -> muffler -> tailpipe); the quasi-1D solver turns this
+    geometry into real transmission loss and tuning. in_*/run_* are the same for
+    the intake duct and the per-cylinder 1D runners. ex_wk/in_wk/run_wk are
+    (>=15, N) MUSCL-Hancock scratch buffers (one per distinct pipe length)."""
     ncyl = int(P[P_NCYL])
     cyc = P[P_CYCLE]
     r = P[P_R]; L = P[P_L]; Apist = P[P_APIST]; Vclear = P[P_VCLEAR]
     Vdisp = P[P_VDISP]
     g = P[P_GAMMA]; R = P[P_RGAS]; cv = P[P_CV]
     cp = cv + R
+    # temperature-dependent cylinder heat capacity cv(T)=cv0_c+b_c*T, anchored so
+    # cv(1500 K) == the configured constant cv (preserves the power calibration)
+    # while gamma falls realistically from cold intake air to hot products.
+    b_c = 0.125
+    cv0_c = cv - b_c * 1500.0
     LHV = P[P_LHV]; AFR = P[P_AFR]; ceff = P[P_COMBEFF]
     ign = P[P_IGN]; burn = P[P_BURN]; wa = P[P_WIEBE_A]; wm = P[P_WIEBE_M]
     Tint = P[P_TINT]
@@ -423,9 +635,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
         run_leff = run_len + 0.85 * np.sqrt(run_area / np.pi)
         inert_k = run_area / run_leff        # inertance coupling (kg/s per Pa.s)
         ram_amin = 0.02 * Ain                # below this valve area, column halts
-        col_mmax = 500.0 * run_area          # column speed cap (m/s) * area
     else:
-        run_leff = 1.0; inert_k = 0.0; ram_amin = 0.0; col_mmax = 0.0
+        run_leff = 1.0; inert_k = 0.0; ram_amin = 0.0
     # mode 2: per-cylinder 1D Euler runner. Each cylinder breathes from its OWN
     # runner head cell (which carries that runner's pressure wave); the runner
     # mouth (tail cell) is open to the plenum at MAP. The ram peak rpm and its
@@ -433,12 +644,11 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     Nr = int(P[P_RUN_NCELLS])
     if ram2 and Nr > 1:
         dx_r = run_len / Nr
-        cell_vol_r = dx_r * run_area
         amax_r = 480.0                       # cool-intake sound-speed headroom
         nsub_r = int(amax_r * dt / (0.8 * dx_r)) + 1
         dt_gas_r = dt / nsub_r
     else:
-        ram2 = False; dx_r = 1.0; cell_vol_r = 1.0; nsub_r = 1; dt_gas_r = dt
+        ram2 = False; dx_r = 1.0; nsub_r = 1; dt_gas_r = dt
     # turbocharger
     turbo = P[P_TURBO] > 0.5
     J_trb = P[P_TRB_INERTIA]; r_imp = P[P_TRB_RIMP]
@@ -447,13 +657,49 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     ht = P[P_HT]; wallT = P[P_WALLT]
     diesel = P[P_DIESEL] > 0.5
     damp = P[P_DAMP]
+    # outgain = 1/(4*pi*r_mic*p_fullscale): together with the d(mdot)/dt tap
+    # below it converts the tailpipe's mass-flow derivative into the acoustic
+    # pressure at the listener (monopole radiation), normalised to full scale.
     outgain = P[P_OUTGAIN]
+    # ground-reflection image source (geometry set in sim): the listener also
+    # hears the tailpipe's mirror image under the asphalt -- +6 dB coherent
+    # low end and a natural comb in the mids, i.e. an outdoor car instead of
+    # a source floating in a void.
+    gnd_n = gnd.shape[0]   # multi-tap radiation delay ring (all paths share it)
+    vt_K = P[P_VTK]        # visco-thermal wall-loss rate K ((1/s)*m)
+    vt_w = P[P_VTW]        # visco-thermal shelf corner (rad/s)
+    # per-cylinder exhaust port + primary-runner buffer (lumped). The valve
+    # blows into THIS volume; the runner area meters it into the 1D pipe.
+    V_port = P[P_PORTV]
+    A_port = P[P_PORTA]
+    port_on = V_port > 0.0
     redline = P[P_REDLINE]
     running = P[P_RUNNING] > 0.5
     starter = P[P_STARTER]
     lpf = P[P_LPF]
     noise = P[P_NOISE]
-    pop = P[P_POP]
+    # afterfire knob = fraction of the cylinder's UNBURNT surplus fuel that
+    # survives into the exhaust pipe un-oxidized (0 = everything burns off /
+    # catalytic exhaust, 1 = race exhaust). Pops are no longer dice rolls: the
+    # pipe carries real unburnt-fuel and free-O2 inventories (pipe_chem) and
+    # deflagrates them when fuel + oxygen + autoignition temperature coexist.
+    afterfire = P[P_AFTERFIRE]
+    T_AIT = 550.0    # gasoline vapour autoignition ~280 C (Kirk-Othmer)
+    T_AFT = 2300.0   # adiabatic flame temperature of gasoline-air (~2300 K):
+    #                  a deflagration cannot heat the local gas past this, which
+    #                  bounds each pop's energy deposit physically
+    LFL_MASS = 0.047  # gasoline lower flammability limit, 1.4 vol% -> mass
+    #                   fraction (MW ~100 vs air 29). Below this the mixture in
+    #                   the ignition cell CANNOT light -- fuel accumulates
+    #                   silently until the slug is rich enough, then burns in
+    #                   one discrete pop. This is what makes crackle a train of
+    #                   separate bangs instead of a buzz at the firing rate.
+    # port wall-film fuel (Aquino X-tau transient-fuelling model): fraction X
+    # of each injection wets the port walls and re-evaporates with time
+    # constant tau (~0.6 s warm). It is what keeps feeding unburnt fuel into
+    # the exhaust for a while after a fuel cut -> the decaying overrun crackle.
+    X_FILM = 0.30
+    inv_tau_film = 1.0 / 0.6
     fuelcut = P[P_FUELCUT] > 0.5     # DFCO / overrun injection cut
     phi_cmd = P[P_PHI]               # commanded equivalence ratio (petrol)
     if phi_cmd <= 0.0:
@@ -470,11 +716,6 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     # load and only detonate when lugged, over-boosted, or fed low octane.
     knock_scale = 4.0
     pipe_area = P[P_PIPEAREA]
-    cell_vol = dx * pipe_area
-    # energy per overrun re-ignition event, scaled to ONE cell's volume so the
-    # local pressure rise stays bounded (~a few atm) and can't blow up the 1D
-    # solver into a checkerboard, however big the engine or fine the grid.
-    pop_burst = patm * cell_vol * 6.0
     if lpf <= 0.0:
         lpf = 1.0
 
@@ -483,8 +724,11 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     # a low resonator adds the exhaust-system body/thump; soft saturation warms
     # transients. Coefficients are precomputed from the sample rate.
     sr = P[P_SR]
-    f_main = 2.0 * np.sin(np.pi * 5200.0 / sr)   # de-hash LPF corner
+    f_main = 2.0 * np.sin(np.pi * 4500.0 / sr)   # de-hash LPF corner (tames the
+    #                                              sharp-pulse HF "tinny" edge)
     d_main = 1.25                                # ~Butterworth damping
+    # crest control is a STATIC soft-clip in the per-sample output stage (no
+    # feedback limiter -- that pumped on the strong periodic diesel pulses).
     # body/Helmholtz resonance: frequency comes from the real muffler chamber
     # geometry (set in _build), not an arbitrary constant.
     body_hz = P[P_BODYFREQ]
@@ -506,13 +750,39 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     # fixed pitch, and the resonators decay faster (lower Q) so the knocks stay
     # DISCRETE even at a fast petrol firing rate instead of smearing into a buzz.
     bore_m = np.sqrt(4.0 * Apist / np.pi)
+    # ---- Woschni heat-transfer constants (precomputed) ----
+    # h = wos_scale*3.26*B^-0.2*p[kPa]^0.8*T^-0.55*w^0.8 ; w = C1*Sp + C2*dp*term.
+    # wos_scale (=P_HT) is the one calibration knob; everything else is the real
+    # Woschni correlation, so wall heat loss now tracks pressure, speed and load.
+    stroke_m = 2.0 * r                       # piston stroke
+    bore_pow = bore_m ** (-0.2)
+    # ring blowby leak area: compression-ring end gap (service spec ~0.0035
+    # m per m of bore) x ring-to-groove side clearance (~50 um spec). Loses
+    # ~0.2% of the charge per cycle at speed (real engines: ~1%), and lets a
+    # PARKED pressurized cylinder leak down in ~a minute like a real one --
+    # without it a stalled engine held tens of bar forever, primed to blast
+    # the intake duct through any valve that parked open.
+    A_blow = 0.0035 * bore_m * 5.0e-5
+    wos_c2 = 3.24e-3                          # combustion velocity coefficient
+    wos_scale = ht                           # P_HT repurposed as the Woschni gain
+    PI_INV = 1.0 / np.pi
     clatter_hz = 145.0 / bore_m
     if clatter_hz < 850.0:
         clatter_hz = 850.0
     elif clatter_hz > 2500.0:
         clatter_hz = 2500.0
-    f_clk1 = 2.0 * np.sin(np.pi * clatter_hz / sr); d_clk1 = 0.30
-    f_clk2 = 2.0 * np.sin(np.pi * 1.9 * clatter_hz / sr); d_clk2 = 0.38
+    # Low Q (high damping) so each combustion event reads as a broadband RATTLE
+    # (real structure-borne diesel "nail") rather than a high-Q tonal ring, which
+    # is what made the synthetic clatter sound fake/buzzy. This is a lumped model
+    # of the block ringing -- not gas dynamics -- so it's deliberately rough.
+    f_clk1 = 2.0 * np.sin(np.pi * clatter_hz / sr); d_clk1 = 0.75
+    f_clk2 = 2.0 * np.sin(np.pi * 1.9 * clatter_hz / sr); d_clk2 = 0.85
+    # impact-envelope decay (~5 ms): each combustion event sets the envelope to
+    # its peak (a peak-follower, so it does NOT integrate over the burn), then it
+    # decays; the envelope gates a broadband noise burst -> a distinct mechanical
+    # KNOCK. At idle the knocks are separated; revving makes them come faster and
+    # blend into a thrash whose RATE rises with rpm (not a fixed tone swelling).
+    clk_decay = np.exp(-1.0 / (0.005 * sr))
     # spark-knock "ping": the end-gas detonation rings the chamber. Lower and
     # softer than before (~4.5 kHz, lower Q) so it reads as a rattle, not a
     # harsh digital sine.
@@ -536,23 +806,23 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
         nbanks = 1
     src_m = np.zeros((nbanks, N))
     src_E = np.zeros((nbanks, N))
+    mdot_b = np.zeros(nbanks)    # per-bank tailpipe mass flow this sample
 
     # intake duct: its own CFL substepping (cooler -> slower sound -> usually
     # fewer substeps than the hot exhaust). Allocate min size 1 when disabled.
     if Ni > 0:
         nsub_in = int(500.0 * dt / (0.8 * dx_in)) + 1
         dt_gas_in = dt / nsub_in
-        cell_vol_in = dx_in * in_area
     else:
         nsub_in = 1
         dt_gas_in = dt
-        cell_vol_in = 1.0
     src_in_m = np.zeros(Ni if Ni > 0 else 1)
     src_in_E = np.zeros(Ni if Ni > 0 else 1)
 
     torque_acc = 0.0
     map_acc = 0.0
     qwall_acc = 0.0      # combustion heat rejected to the walls this block (J)
+    fuel_acc = 0.0       # fuel mass injected this block (kg)
     scope_period = cyc  # one full cycle for cylinder 0
 
     theta = st[S_THETA]
@@ -635,6 +905,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
         # per-cylinder thermodynamics over this sample
         Tgas_torque = 0.0
         clatter_exc = 0.0       # combustion pressure-rise this sample (Pa), for clatter
+        clk_hit = 0.0           # impulsive mechanical impacts this sample (knock+valves)
         knock_exc = 0.0         # end-gas knock excitation this sample
         air_draw = 0.0          # net intake-valve mass flow this sample (duct src)
         for b in range(nbanks):
@@ -656,6 +927,35 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             if Pc < 1.0:
                 Pc = 1.0
 
+            # valve open fractions (hoisted: shared by the Woschni heat transfer
+            # and the valve-flow integration below)
+            fin = open_frac(cph, IVO, IVC, cyc)
+            fex = open_frac(cph, EVO, EVC, cyc)
+
+            # ---- trapped reference captured at IVC (ALL engines): the Woschni
+            # motored-pressure term and the end-gas knock model both read it ----
+            ddk = cph - cph_prev
+            if ddk < 0.0:
+                ddk += cyc
+            rel_ivc = IVC - cph_prev
+            if rel_ivc < 0.0:
+                rel_ivc += cyc
+            ivc_edge = rel_ivc <= ddk
+            if ivc_edge:
+                cyl_knk[c, 0] = T      # trapped temperature
+                cyl_knk[c, 1] = Pc     # trapped pressure
+                cyl_knk[c, 4] = V      # trapped volume (for motored pressure)
+                # trapped-charge composition for the pipe chemistry: until (and
+                # unless) combustion happens this cycle, the charge is fuel-free
+                # and carries its fresh-air fraction (a fuel-cut / motored cycle
+                # pumps O2 into the pipe -- what earns the overrun pops).
+                cyl_chem[c, 0] = 0.0
+                fr_ivc = MAP * Vdisp / (R * Tman)
+                if fr_ivc > m:
+                    fr_ivc = m
+                cyl_chem[c, 1] = fr_ivc / m
+                cyl_chem[c, 3] = 0.0   # combustion-happened flag for this cycle
+
             dQ = 0.0
             # combustion heat release (valves closed window around TDC firing)
             f_now = (cph - ign) / burn
@@ -666,6 +966,23 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             if f_pre < -0.5:
                 f_pre += cyc / burn
             dxb = wiebe(f_now, wa, wm) - wiebe(f_pre, wa, wm)
+            if (not diesel) and cyl_knk[c, 3] > 0.5:
+                # this cycle DETONATED: the flame's Wiebe schedule is over.
+                # The end gas banked at the knock event burns at the rate a
+                # detonation wave crosses the chamber -- one bore transit at
+                # the local sound speed, sqrt(g R T)/bore per second -- which
+                # is ~100 us, not the ~ms of normal flame travel. The
+                # resulting near-instant heat release IS the knock: pressure
+                # spike, torque jolt and structural impact all follow from
+                # the same dq path as normal combustion.
+                rem = cyl_knk[c, 5]
+                dxb = 0.0
+                if rem > 1e-9:
+                    frac = np.sqrt(g * R * T) / bore_m * dt
+                    if frac > 1.0:
+                        frac = 1.0
+                    dxb = rem * frac
+                    cyl_knk[c, 5] = rem - dxb
             rpm_now = omega * 9.5492966   # 60/(2pi)
             if dxb > 0.0 and rpm_now < redline and running and not fuelcut:
                 # fuel energy available this cycle (mass trapped is ~constant now)
@@ -676,6 +993,11 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     fuel_max = air / 23.0
                     fuel = throttle * fuel_max
                     Qcyc = fuel * LHV * ceff
+                    # injected mass this step (dxb sums to 1 over the cycle)
+                    fuel_acc += fuel * dxb
+                    # CI burns lean: no surplus fuel; the leftover O2 fraction
+                    # stays as set at IVC (a diesel exhaust always carries air)
+                    cyl_chem[c, 0] = 0.0
                 else:
                     if ram_on:
                         # meter by the fresh air the runner ACTUALLY inducted this
@@ -709,15 +1031,53 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     if comp < 0.0:
                         comp = 0.0
                     Qcyc = stoich_fuel * burn_phi * LHV * ceff * comp
+                    # injected mass this step: the ECU meters stoich*phi
+                    # whether or not it burns (misfire still spends fuel)
+                    fuel_acc += stoich_fuel * phi_cmd * dxb
+                    # post-burn charge composition (mass fractions), for the
+                    # pipe chemistry. Injected fuel is stoich*phi; the burned
+                    # fuel-equivalent is stoich*burn_phi*comp, which consumes
+                    # the same fraction of the trapped air. The surplus fuel
+                    # (rich running, misfire) and leftover O2 (lean/partial
+                    # burn) ride out with the exhaust -- afterfire scales how
+                    # much fuel survives the port/cat un-oxidized.
+                    bfrac = burn_phi * comp
+                    fuel_un = stoich_fuel * (phi_cmd - bfrac)
+                    if fuel_un < 0.0:
+                        fuel_un = 0.0
+                    air_left = air * (1.0 - bfrac)
+                    if air_left < 0.0:
+                        air_left = 0.0
+                    # only fuel that never saw a FLAME survives as ignitable
+                    # vapour. A fired cycle's rich surplus exits as combustion
+                    # products (CO / cracked HC) -- it stinks, it does not pop.
+                    # comp is the flame completeness, so the poppable fraction
+                    # is (1-comp): ~0 for any normal burn, ~1 for a misfire.
+                    # (Banking ALL surplus made cold running pile mg of "fuel"
+                    # per cycle into the pipe, permanently above the
+                    # flammability gate -> machine-gun pops on every overrun.)
+                    unflamed = 1.0 - comp
+                    if unflamed < 0.0:
+                        unflamed = 0.0
+                    cyl_chem[c, 0] = afterfire * fuel_un * unflamed / m
+                    cyl_chem[c, 1] = air_left / m
+                    # X of the injected fuel deposits on the port walls
+                    # (sum of dxb over the cycle is 1, so this banks X*inj)
+                    cyl_chem[c, 2] += X_FILM * stoich_fuel * phi_cmd * dxb
                 # cycle/flame roughness so cycles aren't mathematically identical
                 rough = 1.0 + noise * np.random.standard_normal()
                 if rough < 0.0:
                     rough = 0.0
                 dq_fuel = Qcyc * dxb * rough
                 dQ += dq_fuel
-                # combustion-clatter excitation: the heat-release pressure rise
-                # (g-1)*dQ/V is what rings the structure (sharp for diesel CI).
-                clatter_exc += (g - 1.0) * dq_fuel / V
+                if dq_fuel > 0.0:
+                    cyl_chem[c, 3] = 1.0   # this cycle actually combusted
+                # combustion impact: the heat-release pressure rise (g-1)*dQ/V is
+                # the force that hammers the structure (sharp for diesel CI). It
+                # feeds the impulse accumulator, not a sustained tone.
+                cb_imp = (g - 1.0) * dq_fuel / V
+                clatter_exc += cb_imp
+                clk_hit += cb_imp
 
             # ---- end-gas knock model (petrol spark-ignition only) -----------
             # The unburned end gas is compressed isentropically by the piston and
@@ -727,17 +1087,10 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             # is promoted by high pressure (boost/CR), high temperature, advanced
             # timing (more end-gas dwell at high P), and low octane -- all emergent.
             if not diesel:
-                ddk = cph - cph_prev
-                if ddk < 0.0:
-                    ddk += cyc
-                rel_ivc = IVC - cph_prev
-                if rel_ivc < 0.0:
-                    rel_ivc += cyc
-                if rel_ivc <= ddk:                  # intake valve just closed
-                    cyl_knk[c, 0] = T               # trapped charge temp/pressure
-                    cyl_knk[c, 1] = Pc              # at start of compression
+                if ivc_edge:                        # intake valve just closed
                     cyl_knk[c, 2] = 0.0             # reset the knock integral
                     cyl_knk[c, 3] = 0.0             # reset knocked-this-cycle flag
+                    cyl_knk[c, 5] = 0.0             # clear undetonated remainder
                 if running and not fuelcut and cyl_knk[c, 3] < 0.5:
                     Tivc = cyl_knk[c, 0]; Pivc = cyl_knk[c, 1]
                     if Pivc > 1.0 and Pc > Pivc:
@@ -747,16 +1100,74 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                             tau = (knock_scale * 0.01768 * (octane * 0.01) ** 3.402
                                    * (Pc / 101325.0) ** (-1.7) * np.exp(3800.0 / Tu))
                             cyl_knk[c, 2] += dt / tau
-                            if cyl_knk[c, 2] >= 1.0:
+                        # hot-surface ignition: charge in contact with metal
+                        # at/above gasoline's auto-ignition temperature
+                        # (~280 C / 553 K) lights off REGARDLESS of octane --
+                        # the glowing-deposit / hot-spot pre-ignition that
+                        # kills overheated engines. Octane only buys time
+                        # against compression heating; it cannot protect a
+                        # charge touching metal hotter than its AIT. This is
+                        # what makes sustained-knock overheating (3x wall
+                        # flux) self-limiting instead of cosmetic.
+                        if wallT > 553.0:
+                            cyl_knk[c, 2] = 1.0
+                        if cyl_knk[c, 2] >= 1.0:
+                            # unburned fraction. f_now was WRAPPED for
+                            # pre-spark angles (it reads as "burn done"),
+                            # which silently suppressed PRE-IGNITION: a
+                            # 1-RON charge that auto-ignites during
+                            # compression must detonate in FULL, not wait
+                            # politely for the spark window (where the
+                            # release lands near TDC = a perfect Otto
+                            # burn -- the bug made awful fuel run BETTER).
+                            # cyl_chem[c,3] is the combusted-this-cycle
+                            # flag: clear = nothing has burned yet.
+                            if cyl_chem[c, 3] < 0.5:
+                                unburned = 1.0
+                            else:
                                 unburned = 1.0 - wiebe(f_now, wa, wm)
-                                if unburned > 0.05:
-                                    ki = unburned * Pc * 1.0e-6   # ~MPa of end gas
-                                    knock_acc += ki
-                                    knock_exc += ki
-                                    cyl_knk[c, 3] = 1.0           # one event / cycle
+                            if unburned > 0.05:
+                                ki = unburned * Pc * 1.0e-6   # ~MPa of end gas
+                                knock_acc += ki
+                                knock_exc += ki
+                                cyl_knk[c, 3] = 1.0           # one event / cycle
+                                # the end gas now detonates: bank it for
+                                # the acoustic-rate release (dxb above)
+                                cyl_knk[c, 5] = unburned
 
-            # heat transfer to walls (lumped)
-            q_w = ht * (T - wallT) * dt
+            # ---- Woschni in-cylinder heat transfer ----
+            # h_c (W/m^2K) rises with charge pressure, gas velocity (piston speed +
+            # a combustion-driven term from the pressure rise above the motored
+            # trace) and falls with temperature. Multiplied by the instantaneous
+            # exposed wall area (crown + head + bared liner). So wall loss now
+            # grows with load and speed -- warm-up, the cold-running enrichment and
+            # the exhaust energy all follow real physics, not a fixed coefficient.
+            Sp = stroke_m * omega * PI_INV          # mean piston speed
+            V_ivc = cyl_knk[c, 4]; P_ivc = cyl_knk[c, 1]; T_ivc = cyl_knk[c, 0]
+            if V_ivc > 1e-12 and P_ivc > 1.0:
+                p_mot = P_ivc * (V_ivc / V) ** g     # motored (no-burn) pressure
+                dpm = Pc - p_mot
+                if dpm < 0.0:
+                    dpm = 0.0
+                w_wos = 2.28 * Sp + wos_c2 * dpm * Vdisp * T_ivc / (P_ivc * V_ivc)
+            else:
+                w_wos = 2.28 * Sp
+            if fin > 0.0 or fex > 0.0:
+                w_wos += 3.9 * Sp                    # gas-exchange velocity (C1=6.18)
+            if w_wos < 0.1:
+                w_wos = 0.1
+            h_wos = (wos_scale * 3.26 * bore_pow * (Pc * 1.0e-3) ** 0.8
+                     * T ** (-0.55) * w_wos ** 0.8)
+            if (not diesel) and cyl_knk[c, 3] > 0.5:
+                # knocking cycle: the detonation's pressure oscillation strips
+                # the thermal boundary layer; measured knocking heat flux runs
+                # 2-5x the Woschni prediction. This is what overheats a
+                # knocking engine (and, via hotter walls -> hotter charge,
+                # what makes sustained knock self-reinforcing).
+                h_wos *= 3.0
+            x_pist = (V - Vclear) / Apist            # piston travel from TDC
+            A_wall = 2.0 * Apist + np.pi * bore_m * x_pist
+            q_w = h_wos * A_wall * (T - wallT) * dt
             dQ -= q_w
             qwall_acc += q_w          # this heat banks into the metal (sim side)
 
@@ -775,7 +1186,6 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             if ram_on and rel_i <= dd:
                 fresh[c] = 0.0
 
-            fin = open_frac(cph, IVO, IVC, cyc)
             if ram2:
                 # ---- 1D wave runner: breathe from THIS cylinder's runner head
                 # cell (it carries the runner's pressure wave); the head-cell
@@ -791,22 +1201,22 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     if P_rh >= Pc:
                         md = orifice_mdot(P_rh, T_rh, Pc, area, Cd, g, R) * dt
                         dm_in += md
-                        dH += md * cp * T_rh
+                        dH += md * _h_of_T(T_rh, cv0_c, b_c, R)
                         air_draw += md
                         fresh[c] += md
                         src_rm[c, 0] -= md          # mass leaves the runner head
-                        src_re[c, 0] -= md * cp * T_rh
+                        src_re[c, 0] -= md * _h_of_T(T_rh, cv0_c, b_c, R)
                         m_man -= md                 # bulk charge drains the plenum
                         if m_man < 1e-9:
                             m_man = 1e-9
                     else:
                         md = orifice_mdot(Pc, T, P_rh, area, Cd, g, R) * dt
                         dm_in -= md
-                        dH -= md * cp * T
+                        dH -= md * _h_of_T(T, cv0_c, b_c, R)
                         air_draw -= md
                         fresh[c] -= md
                         src_rm[c, 0] += md          # reversion back into the runner
-                        src_re[c, 0] += md * cp * T
+                        src_re[c, 0] += md * _h_of_T(T, cv0_c, b_c, R)
                         m_man += md
             elif ram1:
                 # ---- inertia-ram runner: integrate the air column's momentum ----
@@ -820,15 +1230,23 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     # column momentum: plenum pressure minus cylinder minus the
                     # valve loss needed to pass the current flow
                     mdot += dt * inert_k * (MAP - Pc - dP_valve)
-                    if mdot > col_mmax:
-                        mdot = col_mmax
-                    elif mdot < -col_mmax:
-                        mdot = -col_mmax
+                    # the valve is a compressible restriction: the column can
+                    # never pass more than the CHOKED orifice flow for the
+                    # current upstream state (the old 500 m/s cap let a parked
+                    # pressurized cylinder drive supersonic flow into the duct)
+                    if mdot >= 0.0:
+                        cap_m = orifice_mdot(MAP, Tman, 0.0, A_v, Cd, g, R)
+                        if mdot > cap_m:
+                            mdot = cap_m
+                    else:
+                        cap_m = orifice_mdot(Pc, T, 0.0, A_v, Cd, g, R)
+                        if mdot < -cap_m:
+                            mdot = -cap_m
                     run_mdot[c] = mdot
                     md = mdot * dt
                     if md >= 0.0:
                         dm_in += md
-                        dH += md * cp * Tman
+                        dH += md * _h_of_T(Tman, cv0_c, b_c, R)
                         air_draw += md        # induction: mass pulled from tract
                         fresh[c] += md        # real fresh air trapped this cycle
                         if four_stroke:
@@ -837,7 +1255,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                                 m_man = 1e-9
                     else:
                         dm_in += md           # md < 0: reversion out of cylinder
-                        dH += md * cp * T
+                        dH += md * _h_of_T(T, cv0_c, b_c, R)
                         air_draw += md
                         fresh[c] += md
                         if four_stroke:
@@ -850,14 +1268,14 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 if MAP >= Pc:
                     md = orifice_mdot(MAP, Tman, Pc, area, Cd, g, R) * dt
                     dm_in += md
-                    dH += md * cp * Tman
+                    dH += md * _h_of_T(Tman, cv0_c, b_c, R)
                     air_draw += md            # induction: mass pulled from tract
                     if four_stroke:
                         m_man -= md           # charge drawn out of the plenum
                 else:
                     md = orifice_mdot(Pc, T, MAP, area, Cd, g, R) * dt
                     dm_in -= md
-                    dH -= md * cp * T
+                    dH -= md * _h_of_T(T, cv0_c, b_c, R)
                     air_draw -= md            # reversion: pushed back into tract
                     if four_stroke:
                         m_man += md           # reversion back into the plenum
@@ -872,55 +1290,167 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 rel += cyc
             evo_edge = rel <= dd
 
-            fex = open_frac(cph, EVO, EVC, cyc)
             if fex > 0.0:
                 area = Aex * fex
-                # exhaust pipe head cell pressure (in THIS cylinder's bank pipe)
                 cb = cyl_bank[c]
                 ci = inj[c]
-                ui = mom[cb, ci] / rho[cb, ci]
-                Pp = (gex - 1.0) * (Ene[cb, ci] - 0.5 * rho[cb, ci] * ui * ui)
-                if Pp < 1.0:
-                    Pp = 1.0
+                if port_on:
+                    # the valve breathes against ITS OWN port/primary volume
+                    # (the real geometry between valve and collector). The
+                    # EVO backflow slam on a deep-vacuum overrun fills this
+                    # small buffer, not the whole open pipe -- the runner
+                    # orifice below then meters the slosh into the 1D pipe
+                    # with a tau = V/(A*c) ~ 1 ms low-pass, like a header.
+                    Pp = (gex - 1.0) * port_E[c] / V_port
+                    if Pp < 1.0:
+                        Pp = 1.0
+                    Tp = Pp * V_port / (port_m[c] * Rex)
+                else:
+                    # no buffer: pipe head cell pressure directly
+                    ui = mom[cb, ci] / rho[cb, ci]
+                    Pp = (gex - 1.0) * (Ene[cb, ci]
+                                        - 0.5 * rho[cb, ci] * ui * ui)
+                    if Pp < 1.0:
+                        Pp = 1.0
+                    Tp = Pp / (rho[cb, ci] * Rex)
                 if Pc >= Pp:
                     md = orifice_mdot(Pc, T, Pp, area, Cd, g, R) * dt
                     dm_ex += md
-                    dH -= md * cp * T
-                    # deposit into the bank's pipe cell
-                    src_m[cb, ci] += md
-                    src_E[cb, ci] += md * cp * T   # stagnation enthalpy in
+                    dH -= md * _h_of_T(T, cv0_c, b_c, R)
+                    if port_on:
+                        port_m[c] += md
+                        port_E[c] += md * _h_of_T(T, cv0_c, b_c, R)
+                    else:
+                        src_m[cb, ci] += md
+                        src_E[cb, ci] += md * _h_of_T(T, cv0_c, b_c, R)
+                    # unburnt fuel / free O2 ride out with the charge
+                    pipe_chem[cb, 0] += md * cyl_chem[c, 0]
+                    pipe_chem[cb, 1] += md * cyl_chem[c, 1]
                 else:
-                    # reversion: pipe gas back into cylinder
-                    Tp = Pp / (rho[cb, ci] * Rex)
+                    # reversion: port/pipe gas back into cylinder
                     md = orifice_mdot(Pp, Tp, Pc, area, Cd, gex, Rex) * dt
                     dm_ex -= md
-                    dH += md * cp * Tp
-                    src_m[cb, ci] -= md
-                    src_E[cb, ci] -= md * cp * Tp
+                    dH += md * _h_of_T(Tp, cv0_c, b_c, R)
+                    if port_on:
+                        port_m[c] -= md
+                        port_E[c] -= md * _h_of_T(Tp, cv0_c, b_c, R)
+                        if port_m[c] < 1e-7:
+                            port_m[c] = 1e-7
+                        if port_E[c] < 1.0:
+                            port_E[c] = 1.0
+                    else:
+                        src_m[cb, ci] -= md
+                        src_E[cb, ci] -= md * _h_of_T(Tp, cv0_c, b_c, R)
 
-                # ---- overrun backfire (physically gated) ----
-                # When the engine is lean-on-overrun (closed throttle pumping
-                # air -> free O2 in the exhaust) the unburnt fuel that left with
-                # this cylinder's charge auto-ignites in the hot pipe. It can
-                # fire at most ONCE per exhaust event (this EVO edge), so the
-                # crackle is locked to the firing rate, not the sample rate.
-                if pop > 0.0 and evo_edge and np.random.random() < pop * 0.5:
-                    src_E[cb, ci] += pop_burst * (0.6 + 0.8 * np.random.random())
+                # ---- afterfire: the pipe's REAL fuel + O2 inventory deflagrates --
+                # Checked at most once per exhaust event (the EVO edge: a slug of
+                # hot blowdown gas arriving is the ignition source, so pops stay
+                # locked to the firing rate). It needs all three of: unburnt fuel
+                # in the pipe, free oxygen in the pipe, and gas above autoignition.
+                # That is why a rich WOT pull does NOT crackle (no O2 in a rich
+                # exhaust) and the overrun does (DFCO pumps fresh air through a
+                # pipe still wet with fuel from the rich phase before lift-off).
+                # The energy is the burned fuel's heat release, capped so the
+                # local gas cannot exceed the adiabatic flame temperature; what
+                # cannot burn this event stays for the next -> the crackle train.
+                if evo_edge and cyl_chem[c, 3] > 0.5:
+                    # this cycle FIRED: its blowdown slug is flame/burned
+                    # products -- pipe fuel and O2 near the port oxidize
+                    # quietly WITHIN that event (port-temperature oxidation
+                    # is ms-scale), they do not accumulate and detonate.
+                    mf_p = pipe_chem[cb, 0]
+                    ma_p = pipe_chem[cb, 1]
+                    burn_q = ma_p / AFR
+                    if mf_p < burn_q:
+                        burn_q = mf_p
+                    pipe_chem[cb, 0] = mf_p - burn_q
+                    pipe_chem[cb, 1] = ma_p - burn_q * AFR
+
+            # ---- port/primary buffer <-> pipe exchange (every sample: the
+            # port keeps discharging after the valve closes; that tail is
+            # the header-smoothed pulse the collector actually receives) ----
+            if port_on:
+                cb = cyl_bank[c]
+                ci = inj[c]
+                Ppo = (gex - 1.0) * port_E[c] / V_port
+                if Ppo < 1.0:
+                    Ppo = 1.0
+                Tpo = Ppo * V_port / (port_m[c] * Rex)
+                uic = mom[cb, ci] / rho[cb, ci]
+                Ppi = (gex - 1.0) * (Ene[cb, ci]
+                                     - 0.5 * rho[cb, ci] * uic * uic)
+                if Ppi < 1.0:
+                    Ppi = 1.0
+                if Ppo >= Ppi:
+                    mdp = orifice_mdot(Ppo, Tpo, Ppi, A_port, Cd,
+                                       gex, Rex) * dt
+                    if mdp > 0.4 * port_m[c]:
+                        mdp = 0.4 * port_m[c]      # explicit-step bound
+                    hpo = _h_of_T(Tpo, cv0_c, b_c, R)
+                    port_m[c] -= mdp
+                    port_E[c] -= mdp * hpo
+                    src_m[cb, ci] += mdp
+                    src_E[cb, ci] += mdp * hpo
+                else:
+                    Tpi = Ppi / (rho[cb, ci] * Rex)
+                    mdp = orifice_mdot(Ppi, Tpi, Ppo, A_port, Cd,
+                                       gex, Rex) * dt
+                    cap = 0.25 * rho[cb, ci] * pa_ex[ci] * dx
+                    if mdp > cap:
+                        mdp = cap                  # explicit-step bound
+                    hpi = _h_of_T(Tpi, cv0_c, b_c, R)
+                    port_m[c] += mdp
+                    port_E[c] += mdp * hpi
+                    src_m[cb, ci] -= mdp
+                    src_E[cb, ci] -= mdp * hpi
+                # keep the port state physical (T in [150, 3000] K)
+                if port_m[c] < 1e-7:
+                    port_m[c] = 1e-7
+                e_lo = port_m[c] * Rex / (gex - 1.0) * 150.0
+                e_hi = port_m[c] * Rex / (gex - 1.0) * 3000.0
+                if port_E[c] < e_lo:
+                    port_E[c] = e_lo
+                elif port_E[c] > e_hi:
+                    port_E[c] = e_hi
+
+            # ---- ring blowby: leak past the rings to the crankcase (vented
+            # to atmosphere); tiny when running, but it is what lets a parked
+            # cylinder relax to ambient instead of staying loaded forever ----
+            if Pc > patm:
+                md_bb = orifice_mdot(Pc, T, patm, A_blow, Cd, g, R) * dt
+                dm_ex += md_bb
+                dH -= md_bb * _h_of_T(T, cv0_c, b_c, R)
 
             # ---- update cylinder state (energy & mass balance) ----
-            U = m * cv * T
+            # internal energy uses the temperature-dependent cv(T); the new temp is
+            # recovered by inverting u(T) (closed form) so the higher heat capacity
+            # of hot products correctly limits the peak temperature.
+            U = m * _u_of_T(T, cv0_c, b_c)
             work = Pc * dVdth * dth
             U_new = U + dQ - work + dH
             m_new = m + dm_in - dm_ex
             if m_new < 1e-8:
                 m_new = 1e-8
-            T_new = U_new / (m_new * cv)
+            T_new = _T_of_u(U_new / m_new, cv0_c, b_c)
             if T_new < 200.0:
                 T_new = 200.0
             if T_new > 4000.0:
                 T_new = 4000.0
             cyl_m[c] = m_new
             cyl_T[c] = T_new
+
+            # ---- port wall-film evaporation (X-tau). While the cylinder is
+            # firing, the evaporated fuel simply burns with the charge (no
+            # extra accounting); on fuel-cut cycles (DFCO, limiter, shutoff)
+            # it is pumped through UNBURNT and lands in the pipe's fuel
+            # inventory -- the source that sustains the overrun crackle.
+            if not diesel:
+                filmm = cyl_chem[c, 2]
+                if filmm > 0.0:
+                    ev = filmm * dt * inv_tau_film
+                    cyl_chem[c, 2] = filmm - ev
+                    if (not running) or fuelcut or rpm_now >= redline:
+                        pipe_chem[cyl_bank[c], 0] += afterfire * ev
 
             # gas torque on crank = (P - Pcrankcase) * piston force * arm
             Tgas_torque += (Pc - patm) * Apist * (dVdth / Apist)  # = (Pc-patm)*dVdth
@@ -935,24 +1465,92 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 scope_p[idx] = Pc
 
         # ---- exhaust gas dynamics substeps (avg tailpipe = anti-alias) ----
-        # Each bank is advanced as its own 1D pipe; the summed tailpipe gauge
-        # pressure across banks IS the voiced signal -- the bank-to-bank cadence
-        # (and cross-plane bank split) gives the V8/W16 rumble.
-        Pt_acc = 0.0
+        # Each bank is advanced as its own 1D pipe. The radiated sound is the
+        # summed banks' exit MASS-FLOW (a monopole source: what the pipe blows
+        # into the air is what you hear, as d(mdot)/dt at the listener) -- the
+        # bank-to-bank cadence (cross-plane bank split) gives the V8/W16 rumble.
+        # spread the valve sources EVENLY over the CFL substeps (continuity:
+        # the valve flows for the whole sample, not for one substep). The
+        # once-per-substep impulse made every exhaust pulse a sample-rate
+        # step whose broadband hash the d(mdot)/dt radiation tap then
+        # DIFFERENTIATED (+6 dB/oct) -- the same mechanism already fixed on
+        # the intake ("most of the induction buzz"), never applied here:
+        # every muffler/cat rung downstream was fighting a numerically
+        # sharpened source.
+        inv_sub = 1.0 / nsub
+        for b in range(nbanks):
+            mdot_b[b] = 0.0
+            for k in range(N):
+                src_m[b, k] *= inv_sub
+                src_E[b, k] *= inv_sub
         for _ in range(nsub):
             for b in range(nbanks):
-                gas_step(rho[b], mom[b], Ene[b], N, dx, dt_gas, gex, Rex,
-                         patm, Tatm, patm, Tatm, damp, src_m[b], src_E[b],
-                         cell_vol)
-            # sources are an impulse for the whole sample; apply only once
+                gas_step_q(rho[b], mom[b], Ene[b], N, dx, dt_gas, gex, Rex,
+                           patm, Tatm, patm, Tatm, damp, pk_ex, src_m[b],
+                           src_E[b], pa_ex, fa_ex, wk_ex, bnd_ex[b],
+                           vt_ex[b], vt_K, vt_w)
             for b in range(nbanks):
+                mdot_b[b] += mom[b, N - 1] * fa_ex[N]   # rho*u*A at the exit
+        for b in range(nbanks):
+            for k in range(N):
+                src_m[b, k] = 0.0
+                src_E[b, k] = 0.0
+
+        # ---- turbulent afterfire ignition (random in time, NOT valve-locked).
+        # A flammable pocket ignites when turbulent mixing folds it onto hot
+        # gas: a Poisson process at the local eddy-turnover rate f_t = |u|/D
+        # (the only timescale pipe turbulence has -- no tuned constant). Each
+        # ignition consumes a random pocket of the inventory (turbulence
+        # again, parameter-free), so what emerges is bursts of diminishing
+        # pops separated by the time the wall film needs to refill past the
+        # flammability limit -- the irregular gurgling burble of a real
+        # overrun, instead of pops landing on the engine's firing grid.
+        for b in range(nbanks):
+            mf_p = pipe_chem[b, 0]
+            if mf_p > 1e-9:
+                ma_p = pipe_chem[b, 1]
+                r0 = rho[b, 0]
+                vol0 = pa_ex[0] * dx
+                if mf_p > LFL_MASS * r0 * vol0 and ma_p > 1e-12:
+                    u0 = mom[b, 0] / r0
+                    p0 = (gex - 1.0) * (Ene[b, 0] - 0.5 * r0 * u0 * u0)
+                    T0 = p0 / (r0 * Rex)
+                    if T0 > T_AIT:
+                        D0 = 1.1284 * np.sqrt(pa_ex[0])
+                        u_abs = u0 if u0 >= 0.0 else -u0
+                        if np.random.random() < (u_abs / D0) * dt:
+                            burn_p = ma_p / AFR          # O2-limited
+                            if mf_p < burn_p:
+                                burn_p = mf_p            # fuel-limited
+                            burn_p *= np.random.random()  # pocket fraction
+                            E_p = burn_p * LHV
+                            E_cap = cvex * r0 * vol0 * (T_AFT - T0)
+                            if E_cap < 0.0:
+                                E_cap = 0.0
+                            if E_p > E_cap:
+                                E_p = E_cap
+                                burn_p = E_p / LHV
+                            Ene[b, 0] += E_p / vol0
+                            pipe_chem[b, 0] = mf_p - burn_p
+                            pipe_chem[b, 1] = ma_p - burn_p * AFR
+
+        # ---- pipe chemistry transport: the unburnt-fuel / free-O2 inventories
+        # wash out of the tailpipe with the actual exhaust flow, so their
+        # residence time (and the decay of a crackle burst after lift-off) is
+        # set by pipe volume / flow rate -- no time constant to tune.
+        for b in range(nbanks):
+            if pipe_chem[b, 0] > 0.0 or pipe_chem[b, 1] > 0.0:
+                m_pipe = 0.0
                 for k in range(N):
-                    src_m[b, k] = 0.0
-                    src_E[b, k] = 0.0
-            for b in range(nbanks):
+                    m_pipe += rho[b, k] * pa_ex[k]
+                m_pipe *= dx
                 ut = mom[b, N - 1] / rho[b, N - 1]
-                Pt = (gex - 1.0) * (Ene[b, N - 1] - 0.5 * rho[b, N - 1] * ut * ut)
-                Pt_acc += Pt - patm        # gauge, summed over banks
+                if ut > 0.0 and m_pipe > 1e-12:
+                    f_out = rho[b, N - 1] * ut * fa_ex[N] * dt / m_pipe
+                    if f_out > 1.0:
+                        f_out = 1.0
+                    pipe_chem[b, 0] *= 1.0 - f_out
+                    pipe_chem[b, 1] *= 1.0 - f_out
 
         # ---- per-cylinder 1D intake runners (mode 2): advance each runner with
         # its valve draw as a head-cell source and the mouth open to the plenum
@@ -962,9 +1560,10 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 rrho = rho_r[c]; rmom = mom_r[c]; rEne = Ene_r[c]
                 srm = src_rm[c]; sre = src_re[c]
                 for _ in range(nsub_r):
-                    gas_step(rrho, rmom, rEne, Nr, dx_r, dt_gas_r, g, R,
-                             patm, Tatm, MAP, Tman, damp_in, srm, sre,
-                             cell_vol_r)
+                    gas_step_q(rrho, rmom, rEne, Nr, dx_r, dt_gas_r, g, R,
+                               patm, Tatm, MAP, Tman, damp_in, pk_run, srm,
+                               sre, pa_run, fa_run, wk_run, bnd_run[c],
+                               pk_run, 0.0, 0.0)
                     srm[0] = 0.0
                     sre[0] = 0.0
 
@@ -976,22 +1575,22 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
         # pressure wave radiating from the mouth IS the induction "suck"/honk,
         # and it rises with boost -> the turbo's intake character. Loudness
         # scales with airflow automatically (big draw at WOT, tiny at idle).
-        Pin_acc = 0.0
+        mdot_in_acc = 0.0
         if Ni > 0 and ingain > 0.0:
             # sound-only runner: excited by the real valve draw, open at the
-            # mouth to the boost/airbox reservoir which refills it.
-            src_in_m[0] = -air_draw
-            src_in_E[0] = -air_draw * cp * Tman
+            # mouth to the boost/airbox reservoir which refills it. The draw is
+            # spread evenly over the CFL substeps: depositing the whole sample's
+            # mass into one cell on one substep made the source a sample-rate
+            # impulse train whose broadband hash was most of the induction
+            # "buzz". Same total mass/energy per sample, continuous in time.
+            src_in_m[0] = -air_draw / nsub_in
+            src_in_E[0] = -air_draw * cp * Tman / nsub_in
             for _ in range(nsub_in):
-                gas_step(rho_in, mom_in, Ene_in, Ni, dx_in, dt_gas_in, g, R,
-                         patm, Tatm, Pboost, Tman, damp_in, src_in_m, src_in_E,
-                         cell_vol_in)
-                for k in range(Ni):
-                    src_in_m[k] = 0.0
-                    src_in_E[k] = 0.0
-                uin = mom_in[Ni - 1] / rho_in[Ni - 1]
-                Pin = (g - 1.0) * (Ene_in[Ni - 1] - 0.5 * rho_in[Ni - 1] * uin * uin)
-                Pin_acc += Pin
+                gas_step_q(rho_in, mom_in, Ene_in, Ni, dx_in, dt_gas_in, g, R,
+                           patm, Tatm, Pboost, Tman, damp_in, pk_in, src_in_m,
+                           src_in_E, pa_in, fa_in, wk_in, bnd_in,
+                           pk_in, 0.0, 0.0)
+                mdot_in_acc += mom_in[Ni - 1] * fa_in[Ni]   # mouth mass flow
 
         # ---- turbocharger shaft dynamics ----
         # Turbine harvests exhaust enthalpy flux; compressor work loads the
@@ -1026,10 +1625,11 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 omega_trb = 0.0
             # remove the harvested enthalpy from the pipe (back-pressure), bounded
             ext = P_turb * dt
-            cap = 0.3 * Ene[0, trb_cell] * cell_vol
+            trb_vol = pa_ex[trb_cell] * dx
+            cap = 0.3 * Ene[0, trb_cell] * trb_vol
             if ext > cap:
                 ext = cap
-            Ene[0, trb_cell] -= ext / cell_vol
+            Ene[0, trb_cell] -= ext / trb_vol
 
         # ============================================================
         # COUPLED MECHANICS — engine, driveline and vehicle integrated
@@ -1133,8 +1733,37 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             theta = _wrap(theta, cyc)
         torque_acc += Tgas_torque
 
-        # ---- audio output: voiced tailpipe gauge pressure (summed banks) ----
-        raw = Pt_acc / nsub
+        # ---- audio output: per-bank monopole radiation from each tailpipe ----
+        # p(listener) = sum over pipes of d(mdot_exit)/dt / (4*pi*r_path): an
+        # unbaffled open pipe end radiates as a point source of volume flow.
+        # Each bank's tailpipe sits at ITS OWN position under the car, so each
+        # gets its own direct ray and its own ground-image ray (rad[b] =
+        # [direct delay, direct gain, image delay, image gain], gains are
+        # r_ref/r_path with the 1/(4*pi*r_ref) reference in outgain). All
+        # paths write into one shared multi-tap delay ring; the read head is
+        # this sample's summed arrival. The sub-ms inter-pipe delays break
+        # the phase coherence a single summed point source imposes -- twin
+        # pipes half a metre apart do not comb like one pipe. A single-bank
+        # engine has one centred pipe and reproduces the old geometry exactly.
+        gi = int(filt[22])
+        for b in range(nbanks):
+            mt = mdot_b[b] / nsub
+            dmd = (mt - mdot_prev[b]) * sr     # d(mdot)/dt  (kg/s^2)
+            mdot_prev[b] = mt
+            j = gi + int(rad[b, 0])            # direct path
+            if j >= gnd_n:
+                j -= gnd_n
+            gnd[j] += dmd * rad[b, 1]
+            j = gi + int(rad[b, 2])            # ground-image path
+            if j >= gnd_n:
+                j -= gnd_n
+            gnd[j] += dmd * rad[b, 3]
+        raw = gnd[gi]
+        gnd[gi] = 0.0
+        gi += 1
+        if gi >= gnd_n:
+            gi = 0
+        filt[22] = gi
         # DC blocker (removes the static offset/thump)
         hp = raw - filt[0] + 0.999 * filt[1]
         filt[0] = raw
@@ -1162,9 +1791,23 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
         # they must NOT merge into a steady metallic buzz -- they recede into
         # the general roar like a real engine.
         if clatter_mix > 0.0:
-            rpm_s = omega * 9.5492966
-            clk_rpm = 1.0 / (1.0 + (rpm_s / 2200.0) * (rpm_s / 2200.0))
-            exc = clatter_exc * outgain * 0.015
+            # impact-excited noise model: each combustion event (clk_hit) kicks a
+            # fast-decaying envelope; the envelope gates BROADBAND noise that is
+            # then coloured by two low-Q block resonances. The sound is a train of
+            # discrete mechanical knocks whose RATE rises with rpm -- so revving
+            # speeds up a thrash instead of swelling a fixed tone (the old tonal
+            # resonator was what sounded fake on the overrun/rev).
+            # listener-referenced level: rides outgain so the block obeys the
+            # mic distance like every other source. The 0.0035 voicing constant
+            # restores the ORIGINAL clatter-to-exhaust balance: anchoring the
+            # old absolute level (0.09/2750) after the radiation tap left
+            # clatter ~13 dB hot relative to the now-quieter physical exhaust.
+            kick = clk_hit * outgain * 0.0035
+            clk_env = filt[19] * clk_decay
+            if kick > clk_env:                            # peak-follow, don't sum
+                clk_env = kick
+            filt[19] = clk_env
+            exc = clk_env * np.random.standard_normal()   # broadband impact noise
             lpc1 = filt[12]; bpc1 = filt[13]
             hc1 = exc - lpc1 - d_clk1 * bpc1
             bpc1 += f_clk1 * hc1
@@ -1175,7 +1818,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             bpc2 += f_clk2 * hc2
             lpc2 += f_clk2 * bpc2
             filt[14] = lpc2; filt[15] = bpc2
-            sig += clatter_mix * clk_rpm * (bpc1 + 0.6 * bpc2)
+            # weight toward the lower resonance (more thud than tick)
+            sig += clatter_mix * 0.5 * (bpc1 + 0.3 * bpc2)
 
         # ---- spark knock "ping" (end-gas detonation rings the chamber) ----
         if knock_aud > 0.0:
@@ -1193,12 +1837,15 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             filt[18] = ml
             sig = ml
 
-        # ---- induction (intake-mouth) signal: DC-block + de-hash, then mix ----
+        # ---- induction (intake-mouth) signal: same monopole tap as the
+        # exhaust (d(mdot)/dt at the duct mouth), DC-block + de-hash, then mix.
         # NB: this path MUST be de-hashed like the exhaust, else the 1D duct's
         # numerical HF hash leaks through as an "electric buzz" that grows with
         # rpm. A 2-pole lowpass (SVF) removes it and softens the intake tone.
         if Ni > 0:
-            raw_in = Pin_acc / nsub_in - patm
+            mdot_i = mdot_in_acc / nsub_in
+            raw_in = (mdot_i - filt[21]) * sr
+            filt[21] = mdot_i
             hp_in = raw_in - filt[6] + 0.999 * filt[7]
             filt[6] = raw_in
             filt[7] = hp_in
@@ -1210,9 +1857,16 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             filt[8] = lpi; filt[9] = bpi
             sig += ingain * lpi
 
-        # soft saturation (optional): warmth + glues the backfire transients
+        # ---- static soft-clip (crest control without flat-top OR pumping) ----
+        # The blowdown spikes have a high crest factor. A feedback limiter would
+        # duck the gain on every pulse and pump (the sound "cutting off" between
+        # the firing bangs of a slow diesel); a plain tanh flat-tops the peak into
+        # a hard clip. The algebraic sigmoid x/sqrt(1+x^2) is a STATELESS curve:
+        # linear at low level (idle detail kept), it bends the loud peaks over
+        # smoothly and never flat-tops -- no clip, no pump.
         if sat_on:
-            out_audio[s] = np.tanh(1.25 * sig)
+            x = 1.1 * sig
+            out_audio[s] = x / np.sqrt(1.0 + x * x)
         else:
             y = sig
             if y > 1.0:
@@ -1236,5 +1890,6 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     P[P_QWALL] = qwall_acc            # heat into the metal this block (thermal model)
     P[P_BOOSTOUT] = boost_out         # report actual boost (Pa, gauge)
     P[P_KNOCK] = knock_acc            # knock intensity this block (ECU reads it)
+    P[P_FUELUSED] = fuel_acc          # fuel mass injected this block (kg)
 
     return torque_acc / n_samples
