@@ -163,8 +163,10 @@ P_GND_A       = 108 # (legacy, unused: per-bank gains live in the rad table)
 P_FUELUSED    = 109 # (out) fuel mass injected this block (kg)
 P_VTK         = 110 # visco-thermal loss K ((1/s)*m): rate = K/sqrt(A_cell)
 P_VTW         = 111 # visco-thermal shelf corner (rad/s): 2*pi*fc
+P_PORTV       = 112 # per-cylinder exhaust port+primary volume (m^3); 0 = off
+P_PORTA       = 113 # exhaust primary-runner flow area (m^2)
 
-P_NPARAMS     = 112
+P_NPARAMS     = 114
 
 # --- state vector layout (st) ---
 S_THETA       = 0   # crank angle (rad)
@@ -546,7 +548,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                    run_mdot, fresh, cyl_knk, cyl_chem, pipe_chem,
                    rho_r, mom_r, Ene_r, src_rm, src_re,
                    out_audio, scope_p, n_scope, filt, gnd, rad, mdot_prev,
-                   vt_ex,
+                   vt_ex, port_m, port_E,
                    pa_ex, fa_ex, wk_ex,
                    pa_in, fa_in, wk_in,
                    pa_run, fa_run, wk_run,
@@ -666,6 +668,11 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     gnd_n = gnd.shape[0]   # multi-tap radiation delay ring (all paths share it)
     vt_K = P[P_VTK]        # visco-thermal wall-loss rate K ((1/s)*m)
     vt_w = P[P_VTW]        # visco-thermal shelf corner (rad/s)
+    # per-cylinder exhaust port + primary-runner buffer (lumped). The valve
+    # blows into THIS volume; the runner area meters it into the 1D pipe.
+    V_port = P[P_PORTV]
+    A_port = P[P_PORTA]
+    port_on = V_port > 0.0
     redline = P[P_REDLINE]
     running = P[P_RUNNING] > 0.5
     starter = P[P_STARTER]
@@ -1285,31 +1292,55 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
 
             if fex > 0.0:
                 area = Aex * fex
-                # exhaust pipe head cell pressure (in THIS cylinder's bank pipe)
                 cb = cyl_bank[c]
                 ci = inj[c]
-                ui = mom[cb, ci] / rho[cb, ci]
-                Pp = (gex - 1.0) * (Ene[cb, ci] - 0.5 * rho[cb, ci] * ui * ui)
-                if Pp < 1.0:
-                    Pp = 1.0
+                if port_on:
+                    # the valve breathes against ITS OWN port/primary volume
+                    # (the real geometry between valve and collector). The
+                    # EVO backflow slam on a deep-vacuum overrun fills this
+                    # small buffer, not the whole open pipe -- the runner
+                    # orifice below then meters the slosh into the 1D pipe
+                    # with a tau = V/(A*c) ~ 1 ms low-pass, like a header.
+                    Pp = (gex - 1.0) * port_E[c] / V_port
+                    if Pp < 1.0:
+                        Pp = 1.0
+                    Tp = Pp * V_port / (port_m[c] * Rex)
+                else:
+                    # no buffer: pipe head cell pressure directly
+                    ui = mom[cb, ci] / rho[cb, ci]
+                    Pp = (gex - 1.0) * (Ene[cb, ci]
+                                        - 0.5 * rho[cb, ci] * ui * ui)
+                    if Pp < 1.0:
+                        Pp = 1.0
+                    Tp = Pp / (rho[cb, ci] * Rex)
                 if Pc >= Pp:
                     md = orifice_mdot(Pc, T, Pp, area, Cd, g, R) * dt
                     dm_ex += md
                     dH -= md * _h_of_T(T, cv0_c, b_c, R)
-                    # deposit into the bank's pipe cell
-                    src_m[cb, ci] += md
-                    src_E[cb, ci] += md * _h_of_T(T, cv0_c, b_c, R)   # stagnation enthalpy in
+                    if port_on:
+                        port_m[c] += md
+                        port_E[c] += md * _h_of_T(T, cv0_c, b_c, R)
+                    else:
+                        src_m[cb, ci] += md
+                        src_E[cb, ci] += md * _h_of_T(T, cv0_c, b_c, R)
                     # unburnt fuel / free O2 ride out with the charge
                     pipe_chem[cb, 0] += md * cyl_chem[c, 0]
                     pipe_chem[cb, 1] += md * cyl_chem[c, 1]
                 else:
-                    # reversion: pipe gas back into cylinder
-                    Tp = Pp / (rho[cb, ci] * Rex)
+                    # reversion: port/pipe gas back into cylinder
                     md = orifice_mdot(Pp, Tp, Pc, area, Cd, gex, Rex) * dt
                     dm_ex -= md
                     dH += md * _h_of_T(Tp, cv0_c, b_c, R)
-                    src_m[cb, ci] -= md
-                    src_E[cb, ci] -= md * _h_of_T(Tp, cv0_c, b_c, R)
+                    if port_on:
+                        port_m[c] -= md
+                        port_E[c] -= md * _h_of_T(Tp, cv0_c, b_c, R)
+                        if port_m[c] < 1e-7:
+                            port_m[c] = 1e-7
+                        if port_E[c] < 1.0:
+                            port_E[c] = 1.0
+                    else:
+                        src_m[cb, ci] -= md
+                        src_E[cb, ci] -= md * _h_of_T(Tp, cv0_c, b_c, R)
 
                 # ---- afterfire: the pipe's REAL fuel + O2 inventory deflagrates --
                 # Checked at most once per exhaust event (the EVO edge: a slug of
@@ -1334,6 +1365,53 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                         burn_q = mf_p
                     pipe_chem[cb, 0] = mf_p - burn_q
                     pipe_chem[cb, 1] = ma_p - burn_q * AFR
+
+            # ---- port/primary buffer <-> pipe exchange (every sample: the
+            # port keeps discharging after the valve closes; that tail is
+            # the header-smoothed pulse the collector actually receives) ----
+            if port_on:
+                cb = cyl_bank[c]
+                ci = inj[c]
+                Ppo = (gex - 1.0) * port_E[c] / V_port
+                if Ppo < 1.0:
+                    Ppo = 1.0
+                Tpo = Ppo * V_port / (port_m[c] * Rex)
+                uic = mom[cb, ci] / rho[cb, ci]
+                Ppi = (gex - 1.0) * (Ene[cb, ci]
+                                     - 0.5 * rho[cb, ci] * uic * uic)
+                if Ppi < 1.0:
+                    Ppi = 1.0
+                if Ppo >= Ppi:
+                    mdp = orifice_mdot(Ppo, Tpo, Ppi, A_port, Cd,
+                                       gex, Rex) * dt
+                    if mdp > 0.4 * port_m[c]:
+                        mdp = 0.4 * port_m[c]      # explicit-step bound
+                    hpo = _h_of_T(Tpo, cv0_c, b_c, R)
+                    port_m[c] -= mdp
+                    port_E[c] -= mdp * hpo
+                    src_m[cb, ci] += mdp
+                    src_E[cb, ci] += mdp * hpo
+                else:
+                    Tpi = Ppi / (rho[cb, ci] * Rex)
+                    mdp = orifice_mdot(Ppi, Tpi, Ppo, A_port, Cd,
+                                       gex, Rex) * dt
+                    cap = 0.25 * rho[cb, ci] * pa_ex[ci] * dx
+                    if mdp > cap:
+                        mdp = cap                  # explicit-step bound
+                    hpi = _h_of_T(Tpi, cv0_c, b_c, R)
+                    port_m[c] += mdp
+                    port_E[c] += mdp * hpi
+                    src_m[cb, ci] -= mdp
+                    src_E[cb, ci] -= mdp * hpi
+                # keep the port state physical (T in [150, 3000] K)
+                if port_m[c] < 1e-7:
+                    port_m[c] = 1e-7
+                e_lo = port_m[c] * Rex / (gex - 1.0) * 150.0
+                e_hi = port_m[c] * Rex / (gex - 1.0) * 3000.0
+                if port_E[c] < e_lo:
+                    port_E[c] = e_lo
+                elif port_E[c] > e_hi:
+                    port_E[c] = e_hi
 
             # ---- ring blowby: leak past the rings to the crankcase (vented
             # to atmosphere); tiny when running, but it is what lets a parked

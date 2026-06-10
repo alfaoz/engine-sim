@@ -643,6 +643,30 @@ class EngineSim:
         self.mdot_prev = np.zeros(nbanks)
         # visco-thermal shelf state: slow momentum average per exhaust cell
         self.vt_ex = np.zeros((nbanks, N))
+        # ---- per-cylinder exhaust port + primary runner buffer (lumped) ----
+        # The real volume between the exhaust valve and the collector: a
+        # primary tube of ~1.2x the valve flow area (headers are sized just
+        # over the valve they serve) and ~0.4 m length (stock manifold
+        # primary). The EVO pulse fills THIS, and the runner area meters it
+        # into the 1D pipe: tau = V/(A*c) ~ 1 ms -- the header low-pass that
+        # was missing when valves blew straight into the open pipe (the
+        # overrun backflow slosh measured +10 dB OVER WOT without it).
+        # 2-strokes excluded: their port IS the tuned pipe's mouth.
+        # DEFAULT OFF (P_PORTV=0): measured against its own gate the lumped
+        # buffer smoothed the FIRED blowdown (-4 dB) more than the overrun
+        # slosh it was built for (the slosh fundamental ~110 Hz sits BELOW
+        # the buffer's V/(A*c) corner ~240 Hz; the math was knowable in
+        # advance and I built it anyway). Kept in the core behind this
+        # switch because the mechanism (port volume between valve and
+        # collector) is real geometry a future full per-cylinder-primaries
+        # rung will need.
+        A_prim = 1.2 * P[core.P_AEX]
+        P[core.P_PORTA] = A_prim
+        P[core.P_PORTV] = 0.0
+        # port state: [mass, internal energy] per cylinder, starts at ambient
+        v_p = max(P[core.P_PORTV], 1e-9)
+        self.port_m = np.full(ncyl, PATM * v_p / (R_AIR * TATM))
+        self.port_E = np.full(ncyl, PATM * v_p / (GAMMA_EX - 1.0))
         self._apply_radiation()
         self.filt[11] = 1.0          # limiter gain starts at unity
         self.P[core.P_MAP] = PATM
@@ -776,7 +800,13 @@ class EngineSim:
             self._cat_span = (c0, cat_end)
             A_cat = 5.0 * pipe_area
             flat = (0.88 - cat_end) - 5.0 * s   # box budget minus cones
-            if flat > 4.0 * s:
+            # expansion-chamber TL goes as sin^2(kL): at the overrun-slosh
+            # band (~110 Hz, cooled gas) a box needs PHYSICAL length
+            # (>= ~0.35 m) before it silences at all -- 0.14 m stubs
+            # measured 2 dB where a real 0.45 m shell gives ~15. Stage two
+            # boxes only when both come out full-length; otherwise spend
+            # the whole zone on ONE real muffler.
+            if flat > 4.0 * s and flat / 2.618 * L >= 0.35:
                 # FRONT RESONATOR + REAR MUFFLER, separated mid-pipe (the
                 # real OEM layout): staged TL, lengths 1:1.618 so the pass
                 # bands never align.
@@ -1323,6 +1353,7 @@ class EngineSim:
                                self.src_rm, self.src_re,
                                out, self.scope_p, N_SCOPE, self.filt, self.gnd,
                                self.rad, self.mdot_prev, self.vt_ex,
+                               self.port_m, self.port_E,
                                self.ex_area, self.ex_aface, self.ex_wk,
                                self.in_area, self.in_aface, self.in_wk,
                                self.run_area_a, self.run_aface, self.run_wk,
