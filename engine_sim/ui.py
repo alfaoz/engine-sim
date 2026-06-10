@@ -981,7 +981,7 @@ class EngineUI:
                                             self._num("spread", "Runner spread",
                                                       0.2, 0.0, 0.4)
                                             self._num("muffvol",
-                                                      "Muffler vol (L, <0 straight)",
+                                                      "Muffler L (0=auto box, <0 straight)",
                                                       0, -1, 60)
                                             dpg.add_separator()
                                             dpg.add_text("TIMING / CYLINDERS",
