@@ -124,17 +124,35 @@ Landed (each its own commit, gates green, USER EARS PENDING on all):
   rate + 3x Woschni on knocked cycles). 95 RON untouched / 50 RON knocks
   + overheats / 5 RON can't run. No audio layer added; flows through dq.
 
-Queued next (in order), per the talk with the user:
-1. USER LISTENS (live UI): per-bank radiation verdict on a V8/V12 +
-   the two diagnostics (Induction checkbox OFF; de-hash LPF A/B needs a
-   one-line toggle) before anything else stacks.
-2. Visco-thermal sqrt(f) wall loss (Kirchhoff closed form) — the
-   small-signal idle comb killer Darcy can't touch; prerequisite to
-   retiring the fixed 4.5 kHz LPF.
-3. Muffler shell radiation (mass-law transmission from chamber cells) —
+User verdicts (first listen, after rungs 10-13): per-bank radiation OK
+(W16 high-pitch pre-existing, not worsened); induction "a tad roboticy
+but ok" (suspect list, not convicted); "city 1.2 sounds racey even
+with muffler" -> drove the next two rungs.
+
+Landed since (one commit each, gates green, EARS PENDING):
+- `155875a` pre-ignition wrap bug (user's 1-RON-at-140km/h find).
+- `536bbfe` hot-surface ignition >=280 C wall (user's 410-C-metal find).
+- `bb12c13` crackle default 0.
+- `cd4a112` visco-thermal sqrt(f) wall loss REPLACES the flat exhaust
+  damp (flat 0.0015 was backwards: Q~4 at the fundamental, Q~100 mids).
+  Idle ~+5 dB livelier broadband -- needs the muffler rung with it.
+- `45f92eb` staged two-chamber silencer (1:1.618, pass bands never
+  align): city 1.2 idle midband -14 dB, purr intact; V8 WOT ~92 dB SPL
+  with more rumble. LESSONS: transitions sized in cells (sub-cell cones
+  = p*dA impulses, clipped the V8), slope-limit 1.6x/cell, expansion
+  ratio capped 20:1 buildable (45:1 blew the moped tail cone at WOT),
+  muffler floor scales with engine, packing fills the shell span
+  positionally (area rule left the neck as a high-Q mirror cavity).
+
+Queued next:
+1. USER LISTENS: city car (racey fixed?), V8 (rumble), the pair
+   cd4a112+45f92eb re-voiced every silenced 4-stroke.
+2. Muffler shell radiation (mass-law transmission from chamber cells) —
    derived replacement for the rejected synthetic body resonator.
-4. Per-cylinder exhaust primaries -> collector (full header geometry) —
+3. Per-cylinder exhaust primaries -> collector (full header geometry) —
    last, alone, behind a toggle, V12 bench gate.
+4. Open: W16 high-pitched (pre-existing; suspect: 4-way cell split /
+   coarse grid); induction "roboticy" (constant-area duct, fixed LPF).
 
 ## Process rules in force (user-amended)
 
