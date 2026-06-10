@@ -218,8 +218,8 @@ class EngineUI:
         self.sim.P[core.P_KNOCKAUD] = self.sim._knock_on if on else 0.0
 
     def on_mix_muffler(self, s, on):
-        self.sim.mix_muffler = bool(on)
-        self.sim.P[core.P_MUFFLP] = self.sim._muff_on if on else 0.0
+        # swaps the REAL pipe geometry (silenced <-> straight), not a filter
+        self.sim.set_muffler(on)
 
     def on_grade(self, s, v):
         self.sim.set_grade(v / 100.0)          # slider is % slope

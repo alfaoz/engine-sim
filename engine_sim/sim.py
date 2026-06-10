@@ -607,8 +607,7 @@ class EngineSim:
         # The exhaust profile (header -> collector -> muffler -> tailpipe) is built
         # by _exhaust_area_profile so silencer transmission loss and tuning emerge
         # from geometry. Intake duct and runners are (for now) constant-area.
-        self.ex_area = self._exhaust_area_profile(N, pipe_area)
-        self.ex_aface = self._faces(self.ex_area)
+        self._rebuild_exhaust_geometry()
         self.ex_wk = np.zeros((15, N))
         self.in_area = np.full(nin, in_area)
         self.in_aface = self._faces(self.in_area)
@@ -622,41 +621,6 @@ class EngineSim:
         self.bnd_ex = np.zeros((nbanks, 2))
         self.bnd_in = np.zeros(2)
         self.bnd_run = np.zeros((ncyl, 2))
-        # absorptive muffler packing: extra per-cell damping ONLY inside the
-        # silencer chamber (where A(x) opens past the pipe bore). A real
-        # dissipative muffler's glass-pack absorbs ~50-90% of a wave per pass;
-        # a purely reflective chamber keeps the coherent ring ("tube"). Not
-        # for straight pipes or 2-stroke chambers (those SHOULD ring).
-        # per-substep loss sized from dwell: a wave spends ~L_ch/c ~ 1 ms in
-        # the chamber (~180 CFL substeps), so 0.006/substep absorbs ~2/3 of a
-        # pass -- glass-pack territory. (0.06 annihilated the output: ~1e-5
-        # survival per pass.)
-        self.pk_ex = np.zeros(N)
-        if cfg.stroke_cycle == 4 and not self._straight:
-            # packing fills each silencer SHELL wall-to-wall (cones
-            # included), set by the spans the area profile recorded
-            xc_pk = (np.arange(N) + 0.5) / N
-            for lo, hi in self._pack_spans:
-                self.pk_ex[(xc_pk >= lo) & (xc_pk <= hi)] = 0.006
-            if self._cat_span is not None:
-                # cat brick: laminar (Poiseuille) channel damping. A 400 cpsi
-                # monolith has ~1.1 mm hydraulic channels; fully-developed
-                # laminar flow loses momentum at alpha = 32*nu/d^2 (1/s),
-                # frequency-flat and LINEAR -- it bites at any signal level,
-                # exactly what the quadratic Darcy law can't do. nu from
-                # Sutherland at ~800 K cat operating temperature. Converted
-                # to the solver's per-substep fraction with the exact
-                # dt_gas the core will use (same CFL formula).
-                d_ch = 1.1e-3
-                T_cat = 800.0
-                mu_c = (1.716e-5 * (T_cat / 273.15) ** 1.5
-                        * (273.15 + 110.4) / (T_cat + 110.4))
-                nu_c = mu_c * R_AIR * T_cat / PATM
-                alpha_cat = 32.0 * nu_c / (d_ch * d_ch)
-                nsub = int(1150.0 * (1.0 / SAMPLE_RATE) / (0.8 * dx)) + 1
-                dt_gas = (1.0 / SAMPLE_RATE) / nsub
-                lo, hi = self._cat_span
-                self.pk_ex[(xc_pk >= lo) & (xc_pk <= hi)] = alpha_cat * dt_gas
         self.pk_in = np.zeros(max(1, Ni))
         self.pk_run = np.zeros(self.Nr)
 
@@ -695,6 +659,63 @@ class EngineSim:
             af[k] = 0.5 * (area[k - 1] + area[k])
         return af
 
+    def _rebuild_exhaust_geometry(self):
+        """(Re)build the exhaust area profile A(x) and the per-cell loss
+        arrays (glass-pack packing + cat brick) from the current config AND
+        the live Sound-lab muffler toggle. Called at build and whenever the
+        user flips the Muffler checkbox: the toggle swaps the REAL geometry
+        (silenced system vs straight pipe), not a filter. Densities are
+        intensive, so swapping A(x) under a running pipe is safe (one
+        transient, clamps bounded)."""
+        cfg = self.cfg
+        N = self.N
+        pipe_area = self.P[core.P_PIPEAREA]
+        dx = self.P[core.P_DX]
+        self.ex_area = self._exhaust_area_profile(N, pipe_area)
+        self.ex_aface = self._faces(self.ex_area)
+        # absorptive muffler packing: per-cell damping only inside silencer
+        # shells. A glass-pack absorbs ~50-90% of a wave per pass; sized
+        # from dwell (~180 CFL substeps in a chamber): 0.006/substep ~ 2/3
+        # per pass. Not for straight pipes / 2-stroke chambers (they ring).
+        self.pk_ex = np.zeros(N)
+        if cfg.stroke_cycle == 4 and not self._straight_eff():
+            xc_pk = (np.arange(N) + 0.5) / N
+            for lo, hi in self._pack_spans:
+                self.pk_ex[(xc_pk >= lo) & (xc_pk <= hi)] = 0.006
+            if self._cat_span is not None:
+                # cat brick: laminar (Poiseuille) channel damping. A 400 cpsi
+                # monolith has ~1.1 mm hydraulic channels; fully-developed
+                # laminar flow loses momentum at alpha = 32*nu/d^2 (1/s),
+                # frequency-flat and LINEAR -- it bites at any signal level,
+                # exactly what the quadratic Darcy law can't do. nu from
+                # Sutherland at ~800 K cat temperature; converted to the
+                # solver's per-substep fraction with the exact dt_gas the
+                # core will use (same CFL formula).
+                d_ch = 1.1e-3
+                T_cat = 800.0
+                mu_c = (1.716e-5 * (T_cat / 273.15) ** 1.5
+                        * (273.15 + 110.4) / (T_cat + 110.4))
+                nu_c = mu_c * R_AIR * T_cat / PATM
+                alpha_cat = 32.0 * nu_c / (d_ch * d_ch)
+                nsub = int(1150.0 * (1.0 / SAMPLE_RATE) / (0.8 * dx)) + 1
+                dt_gas = (1.0 / SAMPLE_RATE) / nsub
+                lo, hi = self._cat_span
+                self.pk_ex[(xc_pk >= lo) & (xc_pk <= hi)] = alpha_cat * dt_gas
+
+    def _straight_eff(self):
+        """Effective straight-pipe flag: the preset's sentinel OR the live
+        Muffler checkbox off (4-stroke only; a 2-stroke's chamber is engine
+        tuning, not a silencer, and stays)."""
+        if self.cfg.stroke_cycle == 2:
+            return False
+        return self._straight or not self.mix_muffler
+
+    def set_muffler(self, on):
+        """Live Sound-lab toggle: swap the real exhaust geometry."""
+        with self.lock:
+            self.mix_muffler = bool(on)
+            self._rebuild_exhaust_geometry()
+
     def _exhaust_area_profile(self, N, pipe_area):
         """Cross-section A(x) along the exhaust, head cell (x=0, at the ports) ->
         tailpipe outlet (x=1). The quasi-1D solver turns this geometry into real
@@ -717,7 +738,7 @@ class EngineSim:
             stinger = pipe_area * 0.42
             xs = [0.0, 0.12, 0.45, 0.58, 0.86, 1.0]
             ars = [pipe_area, pipe_area, belly, belly, stinger, stinger]
-        elif self._straight:
+        elif self._straight_eff():
             # open / straight pipe: a mild collector step then constant bore
             # (raw quarter-wave resonator, bright and loud -- no silencing)
             xs = [0.0, 0.30, 1.0]
