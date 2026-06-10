@@ -108,6 +108,34 @@ energy cap, washout by real flow. Default survival fraction 0.05 (catted);
   the user cannot attribute regressions and trust erodes — same lesson as
   fable-fuckup §3, still true even with per-rung commits.
 
+## 2026-06-10 session 2 (rungs 10+): what landed, what's queued
+
+Landed (each its own commit, gates green, USER EARS PENDING on all):
+- `0ec9780` idle governor pole placement (SIMC from the real plant) —
+  fixes 2JZ ±135 rpm hunt; NOT a sound change but un-contaminates idle
+  listening. The old inertia-only schedule had ki ~6x too hot.
+- `3d76e4c` fuel meter (P_FUELUSED -> L/h + L/100km UI readouts + trace).
+- `73effa8` **per-bank tailpipe radiation** — each bank's d(mdot)/dt
+  radiates from its own tailpipe position (dual exits 0.8 m apart, own
+  direct + ground-image rays, shared multi-tap ring). Single-bank presets
+  bit-equal to old output; V8/V12/W16 are the A/B. This is the first
+  attack on the "one coherent point source" tube hypothesis.
+- `ca61e65` knock detonation physical (end gas burns at sqrt(gRT)/bore
+  rate + 3x Woschni on knocked cycles). 95 RON untouched / 50 RON knocks
+  + overheats / 5 RON can't run. No audio layer added; flows through dq.
+
+Queued next (in order), per the talk with the user:
+1. USER LISTENS (live UI): per-bank radiation verdict on a V8/V12 +
+   the two diagnostics (Induction checkbox OFF; de-hash LPF A/B needs a
+   one-line toggle) before anything else stacks.
+2. Visco-thermal sqrt(f) wall loss (Kirchhoff closed form) — the
+   small-signal idle comb killer Darcy can't touch; prerequisite to
+   retiring the fixed 4.5 kHz LPF.
+3. Muffler shell radiation (mass-law transmission from chamber cells) —
+   derived replacement for the rejected synthetic body resonator.
+4. Per-cylinder exhaust primaries -> collector (full header geometry) —
+   last, alone, behind a toggle, V12 bench gate.
+
 ## Process rules in force (user-amended)
 
 Thumbs-down handling: retune if a retune is safe → different approach if
