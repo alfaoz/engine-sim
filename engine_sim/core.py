@@ -625,6 +625,12 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     T_AFT = 2300.0   # adiabatic flame temperature of gasoline-air (~2300 K):
     #                  a deflagration cannot heat the local gas past this, which
     #                  bounds each pop's energy deposit physically
+    LFL_MASS = 0.047  # gasoline lower flammability limit, 1.4 vol% -> mass
+    #                   fraction (MW ~100 vs air 29). Below this the mixture in
+    #                   the ignition cell CANNOT light -- fuel accumulates
+    #                   silently until the slug is rich enough, then burns in
+    #                   one discrete pop. This is what makes crackle a train of
+    #                   separate bangs instead of a buzz at the firing rate.
     # port wall-film fuel (Aquino X-tau transient-fuelling model): fraction X
     # of each injection wets the port walls and re-evaporates with time
     # constant tau (~0.6 s warm). It is what keeps feeding unburnt fuel into
@@ -1190,14 +1196,17 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 if evo_edge:
                     mf_p = pipe_chem[cb, 0]
                     ma_p = pipe_chem[cb, 1]
-                    if mf_p > 1e-12 and ma_p > 1e-12:
+                    vol_d = pa_ex[ci] * dx
+                    # ignitable only above the lean flammability limit: the
+                    # fuel must be a big enough fraction of the gas it is
+                    # mixed into (the ignition cell) to carry a flame
+                    if mf_p > LFL_MASS * rho[cb, ci] * vol_d and ma_p > 1e-12:
                         Tp_cell = Pp / (rho[cb, ci] * Rex)
                         if Tp_cell > T_AIT:
                             burn_p = ma_p / AFR          # O2-limited stoich burn
                             if mf_p < burn_p:
                                 burn_p = mf_p            # fuel-limited
                             E_p = burn_p * LHV
-                            vol_d = pa_ex[ci] * dx
                             E_cap = cvex * rho[cb, ci] * vol_d * (T_AFT - Tp_cell)
                             if E_cap < 0.0:
                                 E_cap = 0.0
