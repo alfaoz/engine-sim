@@ -71,6 +71,7 @@ class EngineSim:
         self.shift_timer = 0.0     # clutch-out window during a shift
         self.crank_timer = 0.0
         self.crank_assist = 0.0
+        self.run_time = 0.0        # seconds since the engine caught
         self.clutch_cap = 200.0
         self.boost = 0.0           # actual turbo boost (Pa), spools with lag
         self.thr_smooth = 0.0      # slewed throttle (intake/fuel dynamics)
@@ -558,6 +559,7 @@ class EngineSim:
         self.shift_timer = 0.0
         self.crank_timer = 0.0
         self.crank_assist = 0.0
+        self.run_time = 0.0
         self.boost = 0.0
         self.thr_smooth = 0.0
         self.clutch_engage = 0.0
@@ -887,6 +889,7 @@ class EngineSim:
                 self.state = "running"
                 self.idle_i = 0.08          # seed near the idle-hold demand
                 self.crank_assist = 0.6     # starter overlap window (s)
+                self.run_time = 0.0         # time since catch (DFCO inhibit)
             elif self.crank_timer > 3.0:
                 self.state = "off"          # failed to catch
         else:  # running
@@ -1023,12 +1026,16 @@ class EngineSim:
         # to idle so the governor catches the engine without a stumble.
         idle_t = self.idle_target
         if self.state == "running":
-            if self.pedal < 0.03 and rpm > idle_t * 1.4:
+            self.run_time += dt
+            # DFCO inhibit for the first seconds after catch (production ECU
+            # behavior): the post-start rpm overshoot is NOT an overrun, and
+            # cutting fuel into it destabilises the settle.
+            if self.pedal < 0.03 and rpm > idle_t * 1.4 and self.run_time > 2.0:
                 self.fuelcut = True
             elif self.fuelcut and (self.pedal >= 0.03 or rpm < idle_t * 1.15):
                 self.fuelcut = False
                 self.idle_i = 0.10          # seed idle-air so it doesn't dip on resume
-        else:
+        if self.state != "running":
             self.fuelcut = False
         P[core.P_FUELCUT] = 1.0 if self.fuelcut else 0.0
 
@@ -1146,10 +1153,19 @@ class EngineSim:
             engage_target = 0.0
         elif rolling:
             engage_target = 1.0                        # rolling -> lock up
-        elif omega_eng < 0.8 * idle_w:
-            engage_target = 0.0                        # near stall -> slip free
         else:
-            engage_target = self.pedal                 # launch: feed with throttle
+            # standstill launch: slip the clutch to HOLD the engine at a
+            # launch speed that rises with pedal (what a TCU / driver's left
+            # foot does). Engagement follows the engine's surplus over the
+            # hold band, so a strong engine locks through quickly while a
+            # weak one is held slipping near its launch rpm instead of being
+            # dragged below its torque band and stalled (the old pedal-only
+            # feed bogged a 1.0L hatch to ~250 rpm on every WOT launch and
+            # lived on a knife edge). Continuous, no panic-release cliff.
+            launch_w = idle_w * (1.2 + 1.3 * self.pedal)
+            engage_target = self.pedal * float(np.clip(
+                (omega_eng - 1.1 * idle_w) / (launch_w - 1.1 * idle_w),
+                0.0, 1.0))
         # ease the clutch in slowly for a standstill launch (so the engine revs
         # up rather than bogging); snap shut quickly once the wheels are rolling
         if engage_target <= self.clutch_engage:
