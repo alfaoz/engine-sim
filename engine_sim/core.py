@@ -156,7 +156,11 @@ P_NBANKS      = 105 # number of separate exhaust banks (V/W engines -> 2+)
 
 P_AFTERFIRE   = 106 # rich-running afterfire intensity (over-fuel flames/pops)
 
-P_NPARAMS     = 107
+# --- ground-reflection image source (the "room": mic stands over asphalt) ---
+P_GND_D       = 107 # image-path extra delay (samples)
+P_GND_A       = 108 # image amplitude ratio r_direct/r_image (0 = disabled)
+
+P_NPARAMS     = 109
 
 # --- state vector layout (st) ---
 S_THETA       = 0   # crank angle (rad)
@@ -513,7 +517,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                    rho, mom, Ene, rho_in, mom_in, Ene_in,
                    run_mdot, fresh, cyl_knk, cyl_chem, pipe_chem,
                    rho_r, mom_r, Ene_r, src_rm, src_re,
-                   out_audio, scope_p, n_scope, filt,
+                   out_audio, scope_p, n_scope, filt, gnd,
                    pa_ex, fa_ex, wk_ex,
                    pa_in, fa_in, wk_in,
                    pa_run, fa_run, wk_run,
@@ -625,6 +629,15 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     # below it converts the tailpipe's mass-flow derivative into the acoustic
     # pressure at the listener (monopole radiation), normalised to full scale.
     outgain = P[P_OUTGAIN]
+    # ground-reflection image source (geometry set in sim): the listener also
+    # hears the tailpipe's mirror image under the asphalt -- +6 dB coherent
+    # low end and a natural comb in the mids, i.e. an outdoor car instead of
+    # a source floating in a void.
+    gnd_n = gnd.shape[0]
+    gnd_d = int(P[P_GND_D])
+    if gnd_d >= gnd_n:
+        gnd_d = gnd_n - 1
+    gnd_a = P[P_GND_A]
     redline = P[P_REDLINE]
     running = P[P_RUNNING] > 0.5
     starter = P[P_STARTER]
@@ -1548,6 +1561,17 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
         mdot_t = mdot_acc / nsub
         raw = (mdot_t - filt[20]) * sr      # d(mdot)/dt  (kg/s^2)
         filt[20] = mdot_t
+        if gnd_a > 0.0:
+            gi = int(filt[22])
+            gnd[gi] = raw
+            j = gi - gnd_d
+            if j < 0:
+                j += gnd_n
+            raw = raw + gnd_a * gnd[j]
+            gi += 1
+            if gi >= gnd_n:
+                gi = 0
+            filt[22] = gi
         # DC blocker (removes the static offset/thump)
         hp = raw - filt[0] + 0.999 * filt[1]
         filt[0] = raw

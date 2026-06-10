@@ -27,6 +27,9 @@ SAMPLE_RATE = 48000
 BLOCK = 512
 MIC_R = 2.0            # listener distance from the tailpipe/engine (m)
 P_FULLSCALE = 20.0     # digital full scale = 20 Pa = 120 dB SPL (pain threshold)
+H_SRC = 0.3            # tailpipe height over the ground (m)
+H_EAR = 1.5            # listener ear height (m)
+C_AIR = 343.0          # ambient sound speed for the ground-path delay (m/s)
 N_SCOPE = 720          # cylinder-pressure scope resolution (per cycle)
 TAMB = 293.0           # ambient air / cold-soak temperature (K, ~20 C)
 T_THERMOSTAT = 361.0   # thermostat opening temperature (K, ~88 C)
@@ -573,8 +576,11 @@ class EngineSim:
         # peak-limiter envelope (10) + gain (11); combustion-clatter resonators
         # (12,13) and (14,15); knock ping (16,17); muffler chamber LP (18);
         # clatter impact envelope (19); prev exhaust/intake mdot for the
-        # radiation-tap derivative (20, 21)
-        self.filt = np.zeros(22)
+        # radiation-tap derivative (20, 21); ground-image ring index (22)
+        self.filt = np.zeros(24)
+        # ground-reflection delay line (max image delay ~83 samples @ 0.25 m)
+        self.gnd = np.zeros(128)
+        self._apply_radiation()
         self.filt[11] = 1.0          # limiter gain starts at unity
         self.P[core.P_MAP] = PATM
 
@@ -627,15 +633,30 @@ class EngineSim:
         return np.interp(xc, xs, ars)
 
     # ------------------------------------------------------------- live tuning
+    def _radiation_geom(self):
+        """Direct and ground-image path lengths from the listener geometry:
+        tailpipe at H_SRC over asphalt, ear at H_EAR, mic_r horizontal."""
+        d = self.mic_r if self.mic_r > 0.25 else 0.25
+        r = math.sqrt(d * d + (H_EAR - H_SRC) ** 2)
+        r_img = math.sqrt(d * d + (H_EAR + H_SRC) ** 2)
+        return r, r_img
+
     def out_gain(self):
         """The ONE output-gain formula (build and live UI both use it):
-        monopole radiation at mic_r metres, full scale = P_FULLSCALE Pa."""
-        r = self.mic_r if self.mic_r > 0.25 else 0.25
+        monopole radiation over the direct path, full scale = P_FULLSCALE Pa."""
+        r, _ = self._radiation_geom()
         return 1.0 / (4.0 * math.pi * r * P_FULLSCALE)
+
+    def _apply_radiation(self):
+        """Set output gain + ground-image delay/ratio from the geometry."""
+        r, r_img = self._radiation_geom()
+        self.P[core.P_OUTGAIN] = 1.0 / (4.0 * math.pi * r * P_FULLSCALE)
+        self.P[core.P_GND_A] = r / r_img
+        self.P[core.P_GND_D] = round((r_img - r) / C_AIR * SAMPLE_RATE)
 
     def set_mic_distance(self, r):
         self.mic_r = float(np.clip(r, 0.25, 20.0))
-        self.P[core.P_OUTGAIN] = self.out_gain()
+        self._apply_radiation()
 
     def set_throttle(self, v):
         self.pedal = float(np.clip(v, 0.0, 1.0))
@@ -1024,7 +1045,7 @@ class EngineSim:
                                self.cyl_chem, self.pipe_chem,
                                self.rho_r, self.mom_r, self.Ene_r,
                                self.src_rm, self.src_re,
-                               out, self.scope_p, N_SCOPE, self.filt,
+                               out, self.scope_p, N_SCOPE, self.filt, self.gnd,
                                self.ex_area, self.ex_aface, self.ex_wk,
                                self.in_area, self.in_aface, self.in_wk,
                                self.run_area_a, self.run_aface, self.run_wk,
