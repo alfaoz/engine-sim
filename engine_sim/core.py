@@ -1569,9 +1569,12 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             # discrete mechanical knocks whose RATE rises with rpm -- so revving
             # speeds up a thrash instead of swelling a fixed tone (the old tonal
             # resonator was what sounded fake on the overrun/rev).
-            # level anchored to the pre-radiation-tap voicing (outgain was
-            # ~1/2750 then); the block's own radiation model can replace this
-            kick = clk_hit * (0.09 / 2750.0)
+            # listener-referenced level: rides outgain so the block obeys the
+            # mic distance like every other source. The 0.0035 voicing constant
+            # restores the ORIGINAL clatter-to-exhaust balance: anchoring the
+            # old absolute level (0.09/2750) after the radiation tap left
+            # clatter ~13 dB hot relative to the now-quieter physical exhaust.
+            kick = clk_hit * outgain * 0.0035
             clk_env = filt[19] * clk_decay
             if kick > clk_env:                            # peak-follow, don't sum
                 clk_env = kick
