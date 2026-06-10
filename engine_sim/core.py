@@ -334,7 +334,7 @@ def _hllc(rL, uL, pL, rR, uR, pR, g):
 
 @njit(cache=True, fastmath=True)
 def gas_step_q(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open,
-               damp, src_m, src_E, area, aface, wk, rad):
+               damp, src_m, src_E, area, aface, wk, bnd):
     """One MUSCL-Hancock step of the QUASI-1D Euler equations (variable area
     A(x)) with an HLLC flux. Second-order in space (minmod-limited primitive
     reconstruction) and time (Hancock half-step predictor). Replaces the old
@@ -346,8 +346,10 @@ def gas_step_q(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open,
     aface[k] : area at face k (N+1 faces); momentum sees a p*dA/dx wall force
     wk       : (>=15, N) scratch (primitives, slopes, evolved L/R, dU accumulators)
 
-    Reflecting head wall at face 0; tail face N radiates into a reservoir held at
-    p_open/T_open (atmosphere for the tailpipe, boost/airbox for an intake mouth).
+    Reflecting head wall at face 0; tail face N is a physical open end into a
+    reservoir at p_open/T_open (atmosphere for the tailpipe, boost/airbox for
+    an intake mouth): long waves reflect, short waves radiate out -- see the
+    tail-boundary block. bnd (2,) persists that boundary's filter state.
     """
     rho_open = p_open / (R * T_open)
     E_atm = patm / (g - 1.0)
@@ -428,16 +430,25 @@ def gas_step_q(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open,
     af0 = aface[0]
     F0, F1, F2 = _hllc(rLs[0], -uLs[0], pLs[0], rLs[0], uLs[0], pLs[0], g)
     d0[0] += F0 * af0; d1[0] += F1 * af0; d2[0] += F2 * af0
-    # tail (face N): RADIATING open end. The ghost is blended between the
-    # reflecting reservoir (rad=0: pressure clamped at p_open, a clean pressure-
-    # release reflection -> high-Q "organ pipe") and a transmissive extrapolation
-    # (rad=1: zero-gradient, no reflection). A partial rad lets the open end
-    # radiate energy away each round trip, lowering the standing-wave Q so the
-    # pipe stops sounding like a sealed tube/bottle.
+    # tail (face N): PHYSICAL open end (Levine-Schwinger behaviour). An
+    # unflanged pipe end reflects long waves (ka<<1: pressure release, the
+    # organ-pipe tuning and the exhaust's low-end body) and radiates short
+    # waves away (ka>>1: no reflection -- so high frequencies leave instead of
+    # ringing as a trapped comb). The split is a one-pole on the boundary
+    # deviation with corner ka=1 -> f_c = c/(2*pi*a_exit): set ONLY by the
+    # exit radius and the local sound speed, no tunable reflection constant.
+    # bnd[0]/bnd[1] persist the slow (reflected) parts of (p - p_open) and
+    # (rho - rho_open) between calls; the fast remainder passes out.
     afN = aface[N]
-    omr = 1.0 - rad
-    rho_g = omr * rho_open + rad * rRs[N - 1]
-    p_g = omr * p_open + rad * pRs[N - 1]
+    pin_ = pRs[N - 1]
+    rin_ = rRs[N - 1]
+    c_loc = np.sqrt(g * pin_ / rin_)
+    a_exit = np.sqrt(afN / np.pi)
+    alpha_b = 1.0 - np.exp(-c_loc / a_exit * dt)
+    bnd[0] += alpha_b * ((pin_ - p_open) - bnd[0])
+    bnd[1] += alpha_b * ((rin_ - rho_open) - bnd[1])
+    p_g = pin_ - bnd[0]
+    rho_g = rin_ - bnd[1]
     if p_g < 1.0:
         p_g = 1.0
     if rho_g < 1e-6:
@@ -490,7 +501,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                    out_audio, scope_p, n_scope, filt,
                    pa_ex, fa_ex, wk_ex,
                    pa_in, fa_in, wk_in,
-                   pa_run, fa_run, wk_run):
+                   pa_run, fa_run, wk_run,
+                   bnd_ex, bnd_in, bnd_run):
     """Advance the full engine by n_samples audio samples. Fills out_audio with
     the voiced tailpipe (exhaust) signal plus the intake-mouth induction signal,
     and records cylinder-0 pressure vs crank into scope_p for the UI. Returns
@@ -1237,7 +1249,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             for b in range(nbanks):
                 gas_step_q(rho[b], mom[b], Ene[b], N, dx, dt_gas, gex, Rex,
                            patm, Tatm, patm, Tatm, damp, src_m[b], src_E[b],
-                           pa_ex, fa_ex, wk_ex, 0.28)
+                           pa_ex, fa_ex, wk_ex, bnd_ex[b])
             # sources are an impulse for the whole sample; apply only once
             for b in range(nbanks):
                 for k in range(N):
@@ -1274,7 +1286,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 for _ in range(nsub_r):
                     gas_step_q(rrho, rmom, rEne, Nr, dx_r, dt_gas_r, g, R,
                                patm, Tatm, MAP, Tman, damp_in, srm, sre,
-                               pa_run, fa_run, wk_run, 0.12)
+                               pa_run, fa_run, wk_run, bnd_run[c])
                     srm[0] = 0.0
                     sre[0] = 0.0
 
@@ -1299,7 +1311,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             for _ in range(nsub_in):
                 gas_step_q(rho_in, mom_in, Ene_in, Ni, dx_in, dt_gas_in, g, R,
                            patm, Tatm, Pboost, Tman, damp_in, src_in_m, src_in_E,
-                           pa_in, fa_in, wk_in, 0.12)
+                           pa_in, fa_in, wk_in, bnd_in)
                 mdot_in_acc += mom_in[Ni - 1] * fa_in[Ni]   # mouth mass flow
 
         # ---- turbocharger shaft dynamics ----

@@ -560,6 +560,11 @@ class EngineSim:
         self.run_area_a = np.full(Nr, run_a)
         self.run_aface = self._faces(self.run_area_a)
         self.run_wk = np.zeros((15, Nr))
+        # per-pipe open-end boundary filter state (Levine-Schwinger split):
+        # [slow part of p - p_open, slow part of rho - rho_open]
+        self.bnd_ex = np.zeros((nbanks, 2))
+        self.bnd_in = np.zeros(2)
+        self.bnd_run = np.zeros((ncyl, 2))
 
         self.scope_p = np.full(N_SCOPE, PATM)
         # output filter state: exhaust DC block (0,1), de-hash LPF (2,3),
@@ -1009,7 +1014,8 @@ class EngineSim:
                                out, self.scope_p, N_SCOPE, self.filt,
                                self.ex_area, self.ex_aface, self.ex_wk,
                                self.in_area, self.in_aface, self.in_wk,
-                               self.run_area_a, self.run_aface, self.run_wk)
+                               self.run_area_a, self.run_aface, self.run_wk,
+                               self.bnd_ex, self.bnd_in, self.bnd_run)
             self.torque = float(t)
             self.rpm = self.st[core.S_OMEGA] * 60.0 / (2.0 * math.pi)
             self.v = float(self.st[core.S_V])
