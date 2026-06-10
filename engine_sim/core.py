@@ -889,6 +889,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 if fr_ivc > m:
                     fr_ivc = m
                 cyl_chem[c, 1] = fr_ivc / m
+                cyl_chem[c, 3] = 0.0   # combustion-happened flag for this cycle
 
             dQ = 0.0
             # combustion heat release (valves closed window around TDC firing)
@@ -971,6 +972,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     rough = 0.0
                 dq_fuel = Qcyc * dxb * rough
                 dQ += dq_fuel
+                if dq_fuel > 0.0:
+                    cyl_chem[c, 3] = 1.0   # this cycle actually combusted
                 # combustion impact: the heat-release pressure rise (g-1)*dQ/V is
                 # the force that hammers the structure (sharp for diesel CI). It
                 # feeds the impulse accumulator, not a sustained tone.
@@ -1197,10 +1200,23 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     mf_p = pipe_chem[cb, 0]
                     ma_p = pipe_chem[cb, 1]
                     vol_d = pa_ex[ci] * dx
+                    if cyl_chem[c, 3] > 0.5:
+                        # this cycle FIRED: its blowdown slug is flame/burned
+                        # products -- pipe fuel and O2 near the port oxidize
+                        # quietly WITHIN that event (port-temperature oxidation
+                        # is ms-scale), they do not accumulate and detonate.
+                        # This is why a running engine doesn't machine-gun:
+                        # pops belong to UNFIRED exhaust (fuel cut, misfire,
+                        # limiter), never to ordinary rich/lean imperfection.
+                        burn_q = ma_p / AFR
+                        if mf_p < burn_q:
+                            burn_q = mf_p
+                        pipe_chem[cb, 0] = mf_p - burn_q
+                        pipe_chem[cb, 1] = ma_p - burn_q * AFR
                     # ignitable only above the lean flammability limit: the
                     # fuel must be a big enough fraction of the gas it is
                     # mixed into (the ignition cell) to carry a flame
-                    if mf_p > LFL_MASS * rho[cb, ci] * vol_d and ma_p > 1e-12:
+                    elif mf_p > LFL_MASS * rho[cb, ci] * vol_d and ma_p > 1e-12:
                         Tp_cell = Pp / (rho[cb, ci] * Rex)
                         if Tp_cell > T_AIT:
                             burn_p = ma_p / AFR          # O2-limited stoich burn

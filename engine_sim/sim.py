@@ -423,16 +423,17 @@ class EngineSim:
         # fuelling / ignition / mechanical noise (set live each block)
         P[core.P_FUELCUT] = 0.0     # DFCO injection cut
         P[core.P_PHI] = 1.0         # commanded equivalence ratio (petrol)
-        # Clatter is NOT universal -- it's a character of specific engines, not a
-        # layer on everything. Diesels knock (CI) regardless of size; petrol clatter
-        # belongs to small/characterful engines (singles, twins, triples) and fades
-        # to ZERO on a refined 4+ cylinder petrol engine, which is smooth/creamy.
-        # (Air-cooled/agricultural petrol fours would clatter too, but that needs a
-        # per-engine flag; the cylinder heuristic covers the common cases.)
+        # Mechanical presence through the block. Diesels knock (CI) regardless
+        # of size. Petrol: singles/twins/triples keep their voiced character
+        # level (the original fade); a refined 4+ cylinder car is NOT silent
+        # metal -- it gets a LOW floor (~30% of a single, -10 dB) so idle has
+        # an engine in it instead of only a pipe. (Flat 0.34 for everyone was
+        # tried and was far too loud -- user-rejected; this is the retune.)
         if cfg.diesel:
             self._clatter_on = 0.5 * float(np.clip(4.0 / ncyl, 0.5, 1.0))
         else:
-            self._clatter_on = 0.34 * float(np.clip((4 - ncyl) / 3.0, 0.0, 1.0))
+            fade = 0.34 * float(np.clip((4 - ncyl) / 3.0, 0.0, 1.0))
+            self._clatter_on = max(fade, 0.10)
         self._knock_on = 0.0 if cfg.diesel else 0.30
         P[core.P_CLATTER] = self._clatter_on if self.mix_clatter else 0.0
         P[core.P_OCTANE] = cfg.octane
@@ -516,9 +517,9 @@ class EngineSim:
         # per-cylinder trapped reference + knock state:
         # [T_ivc, P_ivc, Livengood-Wu integral, knocked, V_ivc, spare]
         self.cyl_knk = np.zeros((ncyl, 6))
-        # pipe chemistry: per-cylinder [fuel_frac, air_frac, port wall-film kg]
-        # and per-bank pipe inventories [unburnt fuel kg, free-O2-bearing air kg]
-        self.cyl_chem = np.zeros((ncyl, 3))
+        # pipe chemistry: per-cylinder [fuel_frac, air_frac, port wall-film kg,
+        # fired-this-cycle] + per-bank inventories [unburnt fuel, free-O2 air]
+        self.cyl_chem = np.zeros((ncyl, 4))
         self.pipe_chem = np.zeros((nbanks, 2))
 
         rho0 = PATM / (R_AIR * TATM)
