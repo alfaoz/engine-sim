@@ -88,9 +88,10 @@ class EngineSim:
         # throttled boundary would still be more physical than the reservoir end.
         self.mix_induction = 0.15  # induction mix ON by default (kept modest:
         #                            it runs hot/clips at higher levels)
-        # body resonator is now light voicing on top of the REAL expansion-chamber
-        # geometry (which already supplies the chamber response); was 0.35.
-        self.mix_body = 0.18
+        # synthetic body resonator OFF by default: it is a high-Q tube-flavoured
+        # coloration, redundant (and "tubey") now that the real chamber
+        # geometry, radiation tap and ground image supply the body physically.
+        self.mix_body = 0.0
         self.mix_sat = 1.0
         # new audio sources (toggleable so issues can be A/B'd / soloed).
         # clatter ON by default: it's the engine's raw MECHANICAL noise (the
@@ -422,7 +423,10 @@ class EngineSim:
         P[core.P_NOISE] = 0.06      # combustion cycle-to-cycle roughness
         P[core.P_POP] = 0.0         # unused (pops are now pipe chemistry)
         P[core.P_AFTERFIRE] = 0.0   # unburnt-fuel survival fraction (set live)
-        self.backfire = 0.3         # crackle/afterfire amount (overrun pops + rich flames)
+        # unburnt-fuel survival fraction. A stock catted exhaust oxidizes ~99%
+        # of surplus HC -- 0.05 is already generous; 0.3+ is a race/sport
+        # system and made EVERY car crackle. The UI "crackle" slider scales it.
+        self.backfire = 0.05
         # fuelling / ignition / mechanical noise (set live each block)
         P[core.P_FUELCUT] = 0.0     # DFCO injection cut
         P[core.P_PHI] = 1.0         # commanded equivalence ratio (petrol)
@@ -569,6 +573,16 @@ class EngineSim:
         self.bnd_ex = np.zeros((nbanks, 2))
         self.bnd_in = np.zeros(2)
         self.bnd_run = np.zeros((ncyl, 2))
+        # absorptive muffler packing: extra per-cell damping ONLY inside the
+        # silencer chamber (where A(x) opens past the pipe bore). A real
+        # dissipative muffler's glass-pack absorbs ~50-90% of a wave per pass;
+        # a purely reflective chamber keeps the coherent ring ("tube"). Not
+        # for straight pipes or 2-stroke chambers (those SHOULD ring).
+        self.pk_ex = np.zeros(N)
+        if cfg.stroke_cycle == 4 and not self._straight:
+            self.pk_ex[self.ex_area > 1.5 * pipe_area] = 0.06
+        self.pk_in = np.zeros(max(1, Ni))
+        self.pk_run = np.zeros(self.Nr)
 
         self.scope_p = np.full(N_SCOPE, PATM)
         # output filter state: exhaust DC block (0,1), de-hash LPF (2,3),
@@ -1019,7 +1033,7 @@ class EngineSim:
         # as revs climb the combustion/exhaust roar masks them. Full level up
         # to ~2x idle, then receding as 1/rpm (the code always CLAIMED this
         # behaviour in a comment; now it actually does it).
-        fade_rpm = float(np.clip(2.0 * idle / max(rpm, 1.0), 0.0, 1.0))
+        fade_rpm = float(np.clip((1.5 * idle / max(rpm, 1.0)) ** 2, 0.0, 1.0))
         P[core.P_CLATTER] = (self._clatter_on * fade_rpm
                              if self.mix_clatter else 0.0)
 
@@ -1049,7 +1063,8 @@ class EngineSim:
                                self.ex_area, self.ex_aface, self.ex_wk,
                                self.in_area, self.in_aface, self.in_wk,
                                self.run_area_a, self.run_aface, self.run_wk,
-                               self.bnd_ex, self.bnd_in, self.bnd_run)
+                               self.bnd_ex, self.bnd_in, self.bnd_run,
+                               self.pk_ex, self.pk_in, self.pk_run)
             self.torque = float(t)
             self.rpm = self.st[core.S_OMEGA] * 60.0 / (2.0 * math.pi)
             self.v = float(self.st[core.S_V])

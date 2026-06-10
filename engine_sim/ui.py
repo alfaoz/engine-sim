@@ -201,7 +201,7 @@ class EngineUI:
         self.sim.P[core.P_INGAIN] = self.sim.mix_induction
 
     def on_mix_body(self, s, on):
-        self.sim.mix_body = 0.35 if on else 0.0
+        self.sim.mix_body = 0.18 if on else 0.0
         self.sim.P[core.P_BODYGAIN] = self.sim.mix_body
 
     def on_mix_sat(self, s, on):
@@ -776,7 +776,7 @@ class EngineUI:
                                 dpg.add_checkbox(label="Induction", default_value=True,
                                                  callback=self.on_mix_induction,
                                                  tag="mix_ind")
-                                dpg.add_checkbox(label="Body", default_value=True,
+                                dpg.add_checkbox(label="Body", default_value=False,
                                                  callback=self.on_mix_body,
                                                  tag="mix_body")
                                 dpg.add_checkbox(label="Sat", default_value=True,
@@ -798,7 +798,7 @@ class EngineUI:
                                           live=True)
                                 dpg.add_slider_float(tag="backfire",
                                                      label="crackle",
-                                                     default_value=0.3, min_value=0.0,
+                                                     default_value=0.05, min_value=0.0,
                                                      max_value=3.0, width=110,
                                                      callback=self.on_backfire)
                             with dpg.table(header_row=False,

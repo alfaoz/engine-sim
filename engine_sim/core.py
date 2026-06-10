@@ -338,7 +338,7 @@ def _hllc(rL, uL, pL, rR, uR, pR, g):
 
 @njit(cache=True, fastmath=True)
 def gas_step_q(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open,
-               damp, src_m, src_E, area, aface, wk, bnd):
+               damp, pack, src_m, src_E, area, aface, wk, bnd):
     """One MUSCL-Hancock step of the QUASI-1D Euler equations (variable area
     A(x)) with an HLLC flux. Second-order in space (minmod-limited primitive
     reconstruction) and time (Hancock half-step predictor). Replaces the old
@@ -484,8 +484,10 @@ def gas_step_q(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open,
         if fr > 0.5:
             fr = 0.5
         mom[i] -= fr * mom[i]
-        # gentle wall damping (acoustic/viscous losses)
-        mom[i] -= damp * mom[i]
+        # gentle wall damping (acoustic/viscous losses) + absorptive muffler
+        # packing (pack[i] is nonzero only in silencer-chamber cells: a
+        # glass-pack eats the coherent ring a purely reflective chamber keeps)
+        mom[i] -= (damp + pack[i]) * mom[i]
         # ---- robust clamps (also catch any non-finite value) ----
         ri = rho[i]
         if not (ri == ri) or ri < 1e-4:
@@ -521,7 +523,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                    pa_ex, fa_ex, wk_ex,
                    pa_in, fa_in, wk_in,
                    pa_run, fa_run, wk_run,
-                   bnd_ex, bnd_in, bnd_run):
+                   bnd_ex, bnd_in, bnd_run,
+                   pk_ex, pk_in, pk_run):
     """Advance the full engine by n_samples audio samples. Fills out_audio with
     the voiced tailpipe (exhaust) signal plus the intake-mouth induction signal,
     and records cylinder-0 pressure vs crank into scope_p for the UI. Returns
@@ -1308,8 +1311,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
         for _ in range(nsub):
             for b in range(nbanks):
                 gas_step_q(rho[b], mom[b], Ene[b], N, dx, dt_gas, gex, Rex,
-                           patm, Tatm, patm, Tatm, damp, src_m[b], src_E[b],
-                           pa_ex, fa_ex, wk_ex, bnd_ex[b])
+                           patm, Tatm, patm, Tatm, damp, pk_ex, src_m[b],
+                           src_E[b], pa_ex, fa_ex, wk_ex, bnd_ex[b])
             # sources are an impulse for the whole sample; apply only once
             for b in range(nbanks):
                 for k in range(N):
@@ -1383,8 +1386,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 srm = src_rm[c]; sre = src_re[c]
                 for _ in range(nsub_r):
                     gas_step_q(rrho, rmom, rEne, Nr, dx_r, dt_gas_r, g, R,
-                               patm, Tatm, MAP, Tman, damp_in, srm, sre,
-                               pa_run, fa_run, wk_run, bnd_run[c])
+                               patm, Tatm, MAP, Tman, damp_in, pk_run, srm,
+                               sre, pa_run, fa_run, wk_run, bnd_run[c])
                     srm[0] = 0.0
                     sre[0] = 0.0
 
@@ -1408,8 +1411,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             src_in_E[0] = -air_draw * cp * Tman / nsub_in
             for _ in range(nsub_in):
                 gas_step_q(rho_in, mom_in, Ene_in, Ni, dx_in, dt_gas_in, g, R,
-                           patm, Tatm, Pboost, Tman, damp_in, src_in_m, src_in_E,
-                           pa_in, fa_in, wk_in, bnd_in)
+                           patm, Tatm, Pboost, Tman, damp_in, pk_in, src_in_m,
+                           src_in_E, pa_in, fa_in, wk_in, bnd_in)
                 mdot_in_acc += mom_in[Ni - 1] * fa_in[Ni]   # mouth mass flow
 
         # ---- turbocharger shaft dynamics ----
