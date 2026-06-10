@@ -435,10 +435,10 @@ class EngineSim:
         P[core.P_NOISE] = 0.06      # combustion cycle-to-cycle roughness
         P[core.P_POP] = 0.0         # unused (pops are now pipe chemistry)
         P[core.P_AFTERFIRE] = 0.0   # unburnt-fuel survival fraction (set live)
-        # unburnt-fuel survival fraction. A stock catted exhaust oxidizes ~99%
-        # of surplus HC -- 0.05 is already generous; 0.3+ is a race/sport
-        # system and made EVERY car crackle. The UI "crackle" slider scales it.
-        self.backfire = 0.05
+        # unburnt-fuel survival fraction. Default 0: a stock catted exhaust
+        # oxidizes effectively all surplus HC -- no crackle unless the user
+        # dials it in. The UI "crackle" slider sets it (0.3+ = race system).
+        self.backfire = 0.0
         # fuelling / ignition / mechanical noise (set live each block)
         P[core.P_FUELCUT] = 0.0     # DFCO injection cut
         P[core.P_PHI] = 1.0         # commanded equivalence ratio (petrol)

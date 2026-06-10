@@ -807,7 +807,7 @@ class EngineUI:
                                           live=True)
                                 dpg.add_slider_float(tag="backfire",
                                                      label="crackle",
-                                                     default_value=0.05, min_value=0.0,
+                                                     default_value=0.0, min_value=0.0,
                                                      max_value=3.0, width=110,
                                                      callback=self.on_backfire)
                             with dpg.table(header_row=False,
