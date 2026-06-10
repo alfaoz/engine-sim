@@ -160,7 +160,9 @@ P_AFTERFIRE   = 106 # rich-running afterfire intensity (over-fuel flames/pops)
 P_GND_D       = 107 # image-path extra delay (samples)
 P_GND_A       = 108 # image amplitude ratio r_direct/r_image (0 = disabled)
 
-P_NPARAMS     = 109
+P_FUELUSED    = 109 # (out) fuel mass injected this block (kg)
+
+P_NPARAMS     = 110
 
 # --- state vector layout (st) ---
 S_THETA       = 0   # crank angle (rad)
@@ -789,6 +791,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     torque_acc = 0.0
     map_acc = 0.0
     qwall_acc = 0.0      # combustion heat rejected to the walls this block (J)
+    fuel_acc = 0.0       # fuel mass injected this block (kg)
     scope_period = cyc  # one full cycle for cylinder 0
 
     theta = st[S_THETA]
@@ -942,6 +945,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     fuel_max = air / 23.0
                     fuel = throttle * fuel_max
                     Qcyc = fuel * LHV * ceff
+                    # injected mass this step (dxb sums to 1 over the cycle)
+                    fuel_acc += fuel * dxb
                     # CI burns lean: no surplus fuel; the leftover O2 fraction
                     # stays as set at IVC (a diesel exhaust always carries air)
                     cyl_chem[c, 0] = 0.0
@@ -978,6 +983,9 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     if comp < 0.0:
                         comp = 0.0
                     Qcyc = stoich_fuel * burn_phi * LHV * ceff * comp
+                    # injected mass this step: the ECU meters stoich*phi
+                    # whether or not it burns (misfire still spends fuel)
+                    fuel_acc += stoich_fuel * phi_cmd * dxb
                     # post-burn charge composition (mass fractions), for the
                     # pipe chemistry. Injected fuel is stoich*phi; the burned
                     # fuel-equivalent is stoich*burn_phi*comp, which consumes
@@ -1701,5 +1709,6 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     P[P_QWALL] = qwall_acc            # heat into the metal this block (thermal model)
     P[P_BOOSTOUT] = boost_out         # report actual boost (Pa, gauge)
     P[P_KNOCK] = knock_acc            # knock intensity this block (ECU reads it)
+    P[P_FUELUSED] = fuel_acc          # fuel mass injected this block (kg)
 
     return torque_acc / n_samples

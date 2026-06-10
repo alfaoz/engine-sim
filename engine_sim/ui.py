@@ -46,6 +46,7 @@ class EngineUI:
         self.HIST = 360
         self.h_t = deque([0.0] * self.HIST, maxlen=self.HIST)      # time axis
         self.h_map = deque([0.0] * self.HIST, maxlen=self.HIST)
+        self.h_fuel = deque([0.0] * self.HIST, maxlen=self.HIST)  # L/h
         self.h_boost = deque([0.0] * self.HIST, maxlen=self.HIST)
         self.h_turbo = deque([0.0] * self.HIST, maxlen=self.HIST)  # krpm
         self.h_rpm = deque([0.0] * self.HIST, maxlen=self.HIST)
@@ -658,7 +659,9 @@ class EngineUI:
                          ("EGT", (255, 150, 120), "egt_val", "C")),
                         (("MAP", (255, 200, 120), "map_val", "kPa"),
                          ("Pcyl", (255, 160, 160), "pk_val", "bar")),
-                        (("Lam", (200, 200, 255), "lam_val", ""), None),
+                        (("Lam", (200, 200, 255), "lam_val", ""),
+                         ("Fuel", (255, 230, 140), "fuel_val", "L/h")),
+                        (("Cons", (255, 210, 120), "cons_val", "L/100"), None),
                     ]
                     with dpg.table(header_row=False, borders_innerH=False,
                                    borders_outerH=False, borders_innerV=False,
@@ -745,14 +748,20 @@ class EngineUI:
                                             dpg.add_line_series([0], [0],
                                                                 tag="pipe_series")
                                 with dpg.table_row():
-                                    with dpg.plot(label="Manifold pressure (MAP) vs time",
+                                    with dpg.plot(label="Manifold pressure & fuel rate vs time",
                                                   height=176, width=-1,
                                                   no_inputs=True, tag="plot_map"):
+                                        dpg.add_plot_legend()
                                         dpg.add_plot_axis(dpg.mvXAxis, label="frame",
                                                           tag="map_x")
                                         with dpg.plot_axis(dpg.mvYAxis, label="kPa",
                                                            tag="map_y"):
-                                            dpg.add_line_series([0], [0], tag="map_s")
+                                            dpg.add_line_series([0], [0], tag="map_s",
+                                                                label="MAP kPa")
+                                        with dpg.plot_axis(dpg.mvYAxis, label="L/h",
+                                                           tag="fuel_y"):
+                                            dpg.add_line_series([0], [0], tag="fuel_s",
+                                                                label="fuel L/h")
                                     with dpg.plot(label="Boost & turbo speed vs time",
                                                   height=176, width=-1,
                                                   no_inputs=True, tag="plot_turbo"):
@@ -1142,6 +1151,12 @@ class EngineUI:
         dpg.set_value("egt_val", f"{egt:.0f}")
         dpg.set_value("pk_val", f"{sim.scope_p.max()/1e5:.0f}")
         dpg.set_value("lam_val", "--" if not np.isfinite(lam) else f"{lam:.2f}")
+        # fuel: live rate, plus distance consumption when actually moving
+        lph = sim.fuel_lph
+        dpg.set_value("fuel_val", f"{lph:.1f}" if lph < 10.0 else f"{lph:.0f}")
+        kmh = sim.v * 3.6
+        dpg.set_value("cons_val",
+                      f"{lph / kmh * 100.0:.1f}" if kmh > 3.0 else "--")
 
         # temperature gauge (coolant) + oil/metal + warm-up state
         wf = getattr(sim, "warm_frac", 1.0)
@@ -1245,6 +1260,9 @@ class EngineUI:
         dpg.fit_axis_data("turbo_x"); dpg.fit_axis_data("turbo_y")
         dpg.set_value("map_s", [fx, list(self.h_map)])
         dpg.fit_axis_data("map_x"); dpg.fit_axis_data("map_y")
+        self.h_fuel.append(sim.fuel_lph)
+        dpg.set_value("fuel_s", [fx, list(self.h_fuel)])
+        dpg.fit_axis_data("fuel_y")
 
         # drivetrain readout + vehicle info panel
         veh = sim.vehicle

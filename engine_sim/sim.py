@@ -79,6 +79,8 @@ class EngineSim:
         self.grade = 0.0           # road gradient (rad); driver/scenario input
         self.knock_retard = 0.0    # ECU knock-retard (deg of timing pulled)
         self.knock = 0.0           # telemetry: knock intensity this block
+        self.fuel_rate = 0.0       # smoothed fuel mass flow (kg/s)
+        self.fuel_total_kg = 0.0   # fuel used since this engine was loaded (kg)
         self.wheel_rpm = 0.0
         self.traction_control = True   # cut power on wheelspin (defeatable)
         self.tc_cut = 0.0          # current TC power cut (0..1), telemetry
@@ -117,7 +119,16 @@ class EngineSim:
     def load_config(self, cfg: EngineConfig):
         with self.lock:
             self.cfg = cfg
+            self.fuel_rate = 0.0
+            self.fuel_total_kg = 0.0
             self._build()
+
+    @property
+    def fuel_lph(self):
+        """Smoothed fuel consumption, litres/hour (pump density: petrol
+        ~0.74 kg/L, diesel ~0.84 kg/L)."""
+        rho = 0.84 if self.cfg.diesel else 0.74
+        return self.fuel_rate / rho * 3600.0
 
     def _build(self):
         cfg = self.cfg
@@ -1129,7 +1140,15 @@ class EngineSim:
             self.turbo_rpm = self.st[core.S_TURBO] * 60.0 / (2.0 * math.pi)
             self.knock = float(self.P[core.P_KNOCK])         # knock telemetry
             self.wheel_rpm = self.st[core.S_OMEGA_W] * 60.0 / (2.0 * math.pi)
-            self._thermal_update(n / SAMPLE_RATE)
+            # fuel consumption: the core reports the injected mass per block;
+            # smooth the rate over ~1 s so few-cylinder engines (whose blocks
+            # catch 0 or 1 injection events) read steady instead of strobing.
+            dt_blk = n / SAMPLE_RATE
+            fuel_kg = float(self.P[core.P_FUELUSED])
+            self.fuel_total_kg += fuel_kg
+            self.fuel_rate += ((fuel_kg / dt_blk) - self.fuel_rate) \
+                * min(1.0, dt_blk / 1.0)
+            self._thermal_update(dt_blk)
         return out
 
     def _thermal_update(self, dt):
