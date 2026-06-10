@@ -1066,29 +1066,40 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                             tau = (knock_scale * 0.01768 * (octane * 0.01) ** 3.402
                                    * (Pc / 101325.0) ** (-1.7) * np.exp(3800.0 / Tu))
                             cyl_knk[c, 2] += dt / tau
-                            if cyl_knk[c, 2] >= 1.0:
-                                # unburned fraction. f_now was WRAPPED for
-                                # pre-spark angles (it reads as "burn done"),
-                                # which silently suppressed PRE-IGNITION: a
-                                # 1-RON charge that auto-ignites during
-                                # compression must detonate in FULL, not wait
-                                # politely for the spark window (where the
-                                # release lands near TDC = a perfect Otto
-                                # burn -- the bug made awful fuel run BETTER).
-                                # cyl_chem[c,3] is the combusted-this-cycle
-                                # flag: clear = nothing has burned yet.
-                                if cyl_chem[c, 3] < 0.5:
-                                    unburned = 1.0
-                                else:
-                                    unburned = 1.0 - wiebe(f_now, wa, wm)
-                                if unburned > 0.05:
-                                    ki = unburned * Pc * 1.0e-6   # ~MPa of end gas
-                                    knock_acc += ki
-                                    knock_exc += ki
-                                    cyl_knk[c, 3] = 1.0           # one event / cycle
-                                    # the end gas now detonates: bank it for
-                                    # the acoustic-rate release (dxb above)
-                                    cyl_knk[c, 5] = unburned
+                        # hot-surface ignition: charge in contact with metal
+                        # at/above gasoline's auto-ignition temperature
+                        # (~280 C / 553 K) lights off REGARDLESS of octane --
+                        # the glowing-deposit / hot-spot pre-ignition that
+                        # kills overheated engines. Octane only buys time
+                        # against compression heating; it cannot protect a
+                        # charge touching metal hotter than its AIT. This is
+                        # what makes sustained-knock overheating (3x wall
+                        # flux) self-limiting instead of cosmetic.
+                        if wallT > 553.0:
+                            cyl_knk[c, 2] = 1.0
+                        if cyl_knk[c, 2] >= 1.0:
+                            # unburned fraction. f_now was WRAPPED for
+                            # pre-spark angles (it reads as "burn done"),
+                            # which silently suppressed PRE-IGNITION: a
+                            # 1-RON charge that auto-ignites during
+                            # compression must detonate in FULL, not wait
+                            # politely for the spark window (where the
+                            # release lands near TDC = a perfect Otto
+                            # burn -- the bug made awful fuel run BETTER).
+                            # cyl_chem[c,3] is the combusted-this-cycle
+                            # flag: clear = nothing has burned yet.
+                            if cyl_chem[c, 3] < 0.5:
+                                unburned = 1.0
+                            else:
+                                unburned = 1.0 - wiebe(f_now, wa, wm)
+                            if unburned > 0.05:
+                                ki = unburned * Pc * 1.0e-6   # ~MPa of end gas
+                                knock_acc += ki
+                                knock_exc += ki
+                                cyl_knk[c, 3] = 1.0           # one event / cycle
+                                # the end gas now detonates: bank it for
+                                # the acoustic-rate release (dxb above)
+                                cyl_knk[c, 5] = unburned
 
             # ---- Woschni in-cylinder heat transfer ----
             # h_c (W/m^2K) rises with charge pressure, gas velocity (piston speed +
