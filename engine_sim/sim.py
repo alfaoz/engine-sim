@@ -32,6 +32,7 @@ H_EAR = 1.5            # listener ear height (m)
 C_AIR = 343.0          # ambient sound speed for the ground-path delay (m/s)
 N_SCOPE = 720          # cylinder-pressure scope resolution (per cycle)
 TAMB = 293.0           # ambient air / cold-soak temperature (K, ~20 C)
+GOV_TF = 0.12          # idle-governor rpm measurement filter time constant (s)
 T_THERMOSTAT = 361.0   # thermostat opening temperature (K, ~88 C)
 
 # Per-cylinder intake-runner ram model:
@@ -748,7 +749,7 @@ class EngineSim:
         # instantaneous block rpm by hundreds; regulating that raw value used to
         # saturate the loop on every firing spike and ratchet the idle UP. The
         # governor instead tracks this filtered speed and a rate derived from it. ----
-        a_gov = min(1.0, dt / 0.12)
+        a_gov = min(1.0, dt / GOV_TF)
         self.rpm_gov += (rpm - self.rpm_gov) * a_gov
         gov_rate = (self.rpm_gov - self._rpm_gov_prev) / dt if dt > 0.0 else 0.0
         self._rpm_gov_prev = self.rpm_gov
@@ -805,35 +806,87 @@ class EngineSim:
                 idle_t = self.idle_target
                 err = (idle_t - self.rpm_gov) / idle_t
                 rate_norm = gov_rate / idle_t          # per-second, normalised
-                # gains scale with inertia: damping (kp,kd) must GROW with the
-                # flywheel and the integral (ki) SHRINK, else a huge-inertia plant
-                # (a 9 kg.m^2 bus diesel) goes under-damped and limit-cycles, while
-                # a tiny bike flywheel needs a gentle proportional. sq = sqrt(I/Iref).
-                # Only a big flywheel deviates from the baseline gains: damping
-                # (kp,kd) is floored at the baseline and RAISED with inertia, the
-                # integral (ki) is ceiled at the baseline and LOWERED. So the small
-                # low-inertia engines keep the well-behaved baseline loop and the
-                # huge diesels get the extra damping / gentler integral they need.
-                sq = (cfg.inertia / 0.2) ** 0.5
+                # ---- gains by pole placement on the REAL idle plant ----------
+                # The loop is: demand -> (fuel, or throttle area -> manifold
+                # fill) -> indicated torque -> rpm integrator (1/inertia) ->
+                # GOV_TF measurement filter. Every element of that chain is
+                # known here at runtime, so kp/ki/kd come from the SIMC tuning
+                # rule for an integrating process (Skogestad 2003: with the
+                # closed-loop time constant chosen equal to the effective
+                # delay theta, Kc = 1/(2*k'*theta), tau_I = 8*theta; the
+                # derivative cancels the one dominant lag, series-PID
+                # tau_D = tau2). The old schedule adapted to inertia ONLY and
+                # ignored the lags entirely -- any preset whose manifold +
+                # filter lags put the 180-degree crossover near the loop
+                # bandwidth limit-cycled (the 2JZ hunted +-135 rpm at 0.8 Hz).
+                w_i = idle_t * math.pi / 30.0           # idle target (rad/s)
+                # friction torque the idle must hold, from the LIVE values (the
+                # cold friction multiplier raises it -> firmer cold-idle loop)
+                T_fric = P[core.P_FRIC0] + P[core.P_FRICW] * w_i
+                cycr = P[core.P_CYCLE]                  # cycle length (rad)
+                Vd_tot = P[core.P_VDISP] * cfg.n_cylinders
+                eta_v = 0.9                             # typical NA low-speed VE
+                theta_d = 0.5 * cycr / w_i              # intake->power delay
                 if cfg.diesel:
-                    # proportional-dominant: a common-rail diesel's fuel->torque
-                    # path is near-instant, so the loop tolerates (and needs)
-                    # firm P with a slow trim integral; the old ki=0.55 was
-                    # integral-dominant and slow-hunted +-80 rpm at cold idle.
-                    kp = 0.22 * float(np.clip(sq, 1.0, 5.0))
-                    kd = 0.022 * float(np.clip(sq, 1.0, 9.0))
-                    ki = 0.28 * float(np.clip(1.0 / sq, 0.14, 1.0))
-                    imax = 0.9
+                    # fuel -> torque is direct (no manifold in the fuel path)
+                    # and linear in demand up to the smoke limit, so dT/du is
+                    # the smoke-limited torque from the trapped air at
+                    # atmospheric MAP. Air-standard Otto efficiency is an
+                    # upper bound on eta_i -> over-estimates the plant gain ->
+                    # a conservative (gentler) loop.
+                    air_cyc = eta_v * PATM / (R_AIR * P[core.P_TMAN]) * Vd_tot
+                    eta_i = 1.0 - cfg.compression_ratio ** (1.0 - GAMMA_CYL)
+                    T_max = (eta_i * P[core.P_COMBEFF] * P[core.P_LHV]
+                             * (air_cyc / 23.0) / cycr)
+                    dT_du = max(T_max, T_fric / 0.6)    # idles below 60% fuel
+                    tau2 = GOV_TF                       # only lag: the filter
+                    theta = theta_d + 0.04              # common-rail smoothing
+                elif cfg.stroke_cycle == 2:
+                    # crankcase feed pressure is linear in demand (the PBOOST
+                    # law: 0.03 + 0.97*u), and indicated torque ~ feed
+                    # pressure, so dT/du = 0.97 * full-feed torque.
+                    air_cyc = eta_v * PATM / (R_AIR * P[core.P_TMAN]) * Vd_tot
+                    eta_i = 1.0 - cfg.compression_ratio ** (1.0 - GAMMA_CYL)
+                    T_max = (eta_i * P[core.P_COMBEFF] * P[core.P_LHV]
+                             * (air_cyc / P[core.P_AFR]) / cycr)
+                    dT_du = max(0.97 * T_max, T_fric / 0.6)
+                    tau2 = GOV_TF                       # throttle is wide open
+                    theta = theta_d
                 else:
-                    # kp is only MODERATELY raised with inertia (clamp 2.5): the
-                    # heaviest petrol flywheel (the 4 kg.m^2 radial) is gain-limited
-                    # by the manifold/filter lag, so too much proportional gain makes
-                    # it slow-hunt. The integral is cut and the derivative damping
-                    # kept -- a sweep put the radial's idle swing at its minimum here.
-                    kp = 0.16 * float(np.clip(sq, 1.0, 2.5))
-                    kd = 0.020 * float(np.clip(sq, 1.0, 9.0))
-                    ki = 0.45 * float(np.clip(1.0 / sq, 0.14, 1.0))
-                    imax = 0.85
+                    # 4-stroke petrol: flow through the nearly-closed plate is
+                    # choked (MAP ~0.35 atm at idle, far below the 0.53
+                    # critical ratio), so mdot -- and with it indicated torque
+                    # -- is proportional to plate area A(u) = floor+(1-fl)*u^2.
+                    # At the steady idle point T_ind(u0) = T_fric, so
+                    # dT/du = T_fric * A'(u0)/A(u0): the loop gain needs NO
+                    # efficiency estimate at all. u0 comes from matching the
+                    # engine's swallow rate at idle vacuum to the choked
+                    # throttle flow.
+                    mdot_eng = (eta_v * (0.35 * PATM) / (R_AIR * P[core.P_TMAN])
+                                * Vd_tot * w_i / cycr)
+                    # choked mass flux: p0*sqrt(g/(R*T0))*(2/(g+1))^((g+1)/(2(g-1)))
+                    flux = (PATM * math.sqrt(1.4 / (R_AIR * TAMB))
+                            * (2.0 / 2.4) ** 3.0)
+                    a0 = mdot_eng / (P[core.P_CD] * flux * self.thr_area_max)
+                    fl = self.idle_floor
+                    u0 = math.sqrt(max((min(a0, 0.5) - fl) / (1.0 - fl), 4e-4))
+                    dT_du = (T_fric * 2.0 * u0 * (1.0 - fl)
+                             / (fl + (1.0 - fl) * u0 * u0))
+                    # manifold fill time constant: plenum volume over the
+                    # engine's volumetric swallow rate at idle speed
+                    tau2 = self.man_vol / (eta_v * Vd_tot * w_i / cycr)
+                    theta = theta_d + GOV_TF            # filter lumped as delay
+                # normalised plant: d(rpm/idle)/dt = k' * demand
+                k_pl = dT_du / (cfg.inertia * w_i)
+                theta = max(theta, 0.02)
+                Kc = 1.0 / (2.0 * k_pl * theta)
+                tau_i = 8.0 * theta
+                # series -> parallel PID; broad clips are actuator sanity
+                # bounds for degenerate presets, not tuning.
+                kp = float(np.clip(Kc * (1.0 + tau2 / tau_i), 0.02, 2.5))
+                ki = float(np.clip(Kc / tau_i, 0.005, 2.0))
+                kd = float(np.clip(Kc * tau2, 0.002, 0.6))
+                imax = 0.9 if cfg.diesel else 0.85
                 raw = self.idle_i + kp * err - kd * rate_norm
                 demand = float(np.clip(raw, 0.0, 0.95))
                 # conditional integration: skip only when winding further into a stop
