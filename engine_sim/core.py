@@ -1222,44 +1222,18 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 # The energy is the burned fuel's heat release, capped so the
                 # local gas cannot exceed the adiabatic flame temperature; what
                 # cannot burn this event stays for the next -> the crackle train.
-                if evo_edge:
+                if evo_edge and cyl_chem[c, 3] > 0.5:
+                    # this cycle FIRED: its blowdown slug is flame/burned
+                    # products -- pipe fuel and O2 near the port oxidize
+                    # quietly WITHIN that event (port-temperature oxidation
+                    # is ms-scale), they do not accumulate and detonate.
                     mf_p = pipe_chem[cb, 0]
                     ma_p = pipe_chem[cb, 1]
-                    vol_d = pa_ex[ci] * dx
-                    if cyl_chem[c, 3] > 0.5:
-                        # this cycle FIRED: its blowdown slug is flame/burned
-                        # products -- pipe fuel and O2 near the port oxidize
-                        # quietly WITHIN that event (port-temperature oxidation
-                        # is ms-scale), they do not accumulate and detonate.
-                        # This is why a running engine doesn't machine-gun:
-                        # pops belong to UNFIRED exhaust (fuel cut, misfire,
-                        # limiter), never to ordinary rich/lean imperfection.
-                        burn_q = ma_p / AFR
-                        if mf_p < burn_q:
-                            burn_q = mf_p
-                        pipe_chem[cb, 0] = mf_p - burn_q
-                        pipe_chem[cb, 1] = ma_p - burn_q * AFR
-                    # ignitable only above the lean flammability limit: the
-                    # fuel must be a big enough fraction of the gas it is
-                    # mixed into (the ignition cell) to carry a flame
-                    elif mf_p > LFL_MASS * rho[cb, ci] * vol_d and ma_p > 1e-12:
-                        Tp_cell = Pp / (rho[cb, ci] * Rex)
-                        if Tp_cell > T_AIT:
-                            burn_p = ma_p / AFR          # O2-limited stoich burn
-                            if mf_p < burn_p:
-                                burn_p = mf_p            # fuel-limited
-                            E_p = burn_p * LHV
-                            E_cap = cvex * rho[cb, ci] * vol_d * (T_AFT - Tp_cell)
-                            if E_cap < 0.0:
-                                E_cap = 0.0
-                            if E_p > E_cap:
-                                E_p = E_cap
-                                burn_p = E_p / LHV
-                            src_E[cb, ci] += E_p
-                            mf_p -= burn_p
-                            ma_p -= burn_p * AFR
-                            pipe_chem[cb, 0] = mf_p if mf_p > 0.0 else 0.0
-                            pipe_chem[cb, 1] = ma_p if ma_p > 0.0 else 0.0
+                    burn_q = ma_p / AFR
+                    if mf_p < burn_q:
+                        burn_q = mf_p
+                    pipe_chem[cb, 0] = mf_p - burn_q
+                    pipe_chem[cb, 1] = ma_p - burn_q * AFR
 
             # ---- ring blowby: leak past the rings to the crankcase (vented
             # to atmosphere); tiny when running, but it is what lets a parked
@@ -1330,6 +1304,44 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     src_E[b, k] = 0.0
             for b in range(nbanks):
                 mdot_acc += mom[b, N - 1] * fa_ex[N]   # rho*u*A at the exit
+
+        # ---- turbulent afterfire ignition (random in time, NOT valve-locked).
+        # A flammable pocket ignites when turbulent mixing folds it onto hot
+        # gas: a Poisson process at the local eddy-turnover rate f_t = |u|/D
+        # (the only timescale pipe turbulence has -- no tuned constant). Each
+        # ignition consumes a random pocket of the inventory (turbulence
+        # again, parameter-free), so what emerges is bursts of diminishing
+        # pops separated by the time the wall film needs to refill past the
+        # flammability limit -- the irregular gurgling burble of a real
+        # overrun, instead of pops landing on the engine's firing grid.
+        for b in range(nbanks):
+            mf_p = pipe_chem[b, 0]
+            if mf_p > 1e-9:
+                ma_p = pipe_chem[b, 1]
+                r0 = rho[b, 0]
+                vol0 = pa_ex[0] * dx
+                if mf_p > LFL_MASS * r0 * vol0 and ma_p > 1e-12:
+                    u0 = mom[b, 0] / r0
+                    p0 = (gex - 1.0) * (Ene[b, 0] - 0.5 * r0 * u0 * u0)
+                    T0 = p0 / (r0 * Rex)
+                    if T0 > T_AIT:
+                        D0 = 1.1284 * np.sqrt(pa_ex[0])
+                        u_abs = u0 if u0 >= 0.0 else -u0
+                        if np.random.random() < (u_abs / D0) * dt:
+                            burn_p = ma_p / AFR          # O2-limited
+                            if mf_p < burn_p:
+                                burn_p = mf_p            # fuel-limited
+                            burn_p *= np.random.random()  # pocket fraction
+                            E_p = burn_p * LHV
+                            E_cap = cvex * r0 * vol0 * (T_AFT - T0)
+                            if E_cap < 0.0:
+                                E_cap = 0.0
+                            if E_p > E_cap:
+                                E_p = E_cap
+                                burn_p = E_p / LHV
+                            Ene[b, 0] += E_p / vol0
+                            pipe_chem[b, 0] = mf_p - burn_p
+                            pipe_chem[b, 1] = ma_p - burn_p * AFR
 
         # ---- pipe chemistry transport: the unburnt-fuel / free-O2 inventories
         # wash out of the tailpipe with the actual exhaust flow, so their
