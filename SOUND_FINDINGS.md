@@ -203,9 +203,36 @@ per-cylinder-primaries plan in cheap 1-state form, like intake
 RAM_MODE 1). Re-voices every preset (it is the header) -> goes in
 ALONE, user listens.
 
+Fifth round — the slosh band defeated four geometric attacks:
+- Port buffer built (`27ad510`, default OFF): failed its gate — slosh
+  fundamental (~110 Hz) is BELOW the V/(A*c) corner (~240 Hz); it
+  deadened FIRED blowdown instead. Box separation, packing-off, and
+  full-length boxes: 80-200 Hz overrun band pinned at 42-44 dB in
+  every config INCLUDING MUFFLER OFF. Mass conservation sets it: EVO
+  backflow pumps ±0.2 g/cycle and a <=2 m pipe is transparent at
+  110 Hz. The model is internally consistent (~90 dB SPL at 2 m from
+  that pump). A real car's overrun is quieter mainly via (a) higher
+  overrun MAP (~15-20 kPa real vs our 5-8 — between my two dashpot
+  attempts; no derivable law found yet, deferred) and (b) softer slam
+  harmonics. STOP attacking this with in-pipe geometry.
+- Long-box rung kept (`27ad510`): TL ~ sin^2(kL); two-box staging only
+  when both >=0.35 m, else ONE real muffler. Re-voices V8s + city.
+
+USER REPORT (live, post-cat): muffled V8 "really robotic".
+Hypothesis: the cat stripped the 3-8 kHz air (-9 dB) that masked the
+STATIC 4-tap comb (2 pipes x direct+ground-image, all fixed delays);
+a bare harmonic stack + fixed comb = robotic. TEST FOR USER: drag the
+mic-distance slider while listening — the image delay (and comb
+spacing) changes with distance; if the robotic character shifts
+pitch/depth with the slider, the static comb is convicted. Fix
+direction then: diffuse/scattered ground image (asphalt + underbody
+scatter, not a perfect mirror), NOT more pipe work.
+
 Queued next:
-1. Per-cylinder lumped exhaust port buffer (above) -- pending user GO.
-2. USER LISTENS after each rung as always.
+1. USER: mic-distance comb test on the muffled V8 (above) + verdict on
+   the long-box V8 voice (one real muffler now, was two stubs).
+2. If comb convicted: diffuse ground-image reflection (physical
+   scattering) as the next single rung.
 2. Muffler shell radiation (mass-law transmission from chamber cells) —
    derived replacement for the rejected synthetic body resonator.
 3. Per-cylinder exhaust primaries -> collector (full header geometry) —
