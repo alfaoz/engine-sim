@@ -209,8 +209,8 @@ class EngineUI:
         self.sim.P[core.P_SAT] = self.sim.mix_sat
 
     def on_mix_clatter(self, s, on):
+        # level itself is set each block by _control_update (rpm fade)
         self.sim.mix_clatter = bool(on)
-        self.sim.P[core.P_CLATTER] = self.sim._clatter_on if on else 0.0
 
     def on_mix_knock(self, s, on):
         self.sim.mix_knock = bool(on)

@@ -424,16 +424,16 @@ class EngineSim:
         P[core.P_FUELCUT] = 0.0     # DFCO injection cut
         P[core.P_PHI] = 1.0         # commanded equivalence ratio (petrol)
         # Mechanical presence through the block. Diesels knock (CI) regardless
-        # of size. Petrol: singles/twins/triples keep their voiced character
-        # level (the original fade); a refined 4+ cylinder car is NOT silent
-        # metal -- it gets a LOW floor (~30% of a single, -10 dB) so idle has
-        # an engine in it instead of only a pipe. (Flat 0.34 for everyone was
-        # tried and was far too loud -- user-rejected; this is the retune.)
+        # of size. Petrol clatter belongs to small/characterful engines
+        # (singles, twins, triples) and is ZERO on a refined 4+ cylinder
+        # petrol (an LFA does not clatter -- the 0.10 floor for cars was
+        # tried twice and user-rejected both times). Additionally the level
+        # FADES WITH RPM in _control_update: the knocks are an idle/low-rpm
+        # character that recedes into the combustion roar as revs climb.
         if cfg.diesel:
             self._clatter_on = 0.5 * float(np.clip(4.0 / ncyl, 0.5, 1.0))
         else:
-            fade = 0.34 * float(np.clip((4 - ncyl) / 3.0, 0.0, 1.0))
-            self._clatter_on = max(fade, 0.10)
+            self._clatter_on = 0.34 * float(np.clip((4 - ncyl) / 3.0, 0.0, 1.0))
         self._knock_on = 0.0 if cfg.diesel else 0.30
         P[core.P_CLATTER] = self._clatter_on if self.mix_clatter else 0.0
         P[core.P_OCTANE] = cfg.octane
@@ -777,9 +777,13 @@ class EngineSim:
                 # huge diesels get the extra damping / gentler integral they need.
                 sq = (cfg.inertia / 0.2) ** 0.5
                 if cfg.diesel:
-                    kp = 0.13 * float(np.clip(sq, 1.0, 5.0))
-                    kd = 0.016 * float(np.clip(sq, 1.0, 9.0))
-                    ki = 0.55 * float(np.clip(1.0 / sq, 0.14, 1.0))
+                    # proportional-dominant: a common-rail diesel's fuel->torque
+                    # path is near-instant, so the loop tolerates (and needs)
+                    # firm P with a slow trim integral; the old ki=0.55 was
+                    # integral-dominant and slow-hunted +-80 rpm at cold idle.
+                    kp = 0.22 * float(np.clip(sq, 1.0, 5.0))
+                    kd = 0.022 * float(np.clip(sq, 1.0, 9.0))
+                    ki = 0.28 * float(np.clip(1.0 / sq, 0.14, 1.0))
                     imax = 0.9
                 else:
                     # kp is only MODERATELY raised with inertia (clamp 2.5): the
@@ -990,6 +994,14 @@ class EngineSim:
         P[core.P_JWHEEL] = 1.0 + veh.mass * 8.0e-4
         P[core.P_GRADE] = self.grade
 
+        # ---- clatter rpm fade: mechanical knocks are an idle/low-rpm sound;
+        # as revs climb the combustion/exhaust roar masks them. Full level up
+        # to ~2x idle, then receding as 1/rpm (the code always CLAIMED this
+        # behaviour in a comment; now it actually does it).
+        fade_rpm = float(np.clip(2.0 * idle / max(rpm, 1.0), 0.0, 1.0))
+        P[core.P_CLATTER] = (self._clatter_on * fade_rpm
+                             if self.mix_clatter else 0.0)
+
         # ---- engine bookkeeping ----
         P[core.P_LOAD] = self.load
         P[core.P_INERTIA] = self.base_inertia
@@ -1068,8 +1080,13 @@ class EngineSim:
         self.friction_mult = 1.0 + 2.3 * (1.0 - owf) ** 1.4
         P[core.P_FRIC0] = self.base_fric0 * self.friction_mult
         P[core.P_FRICW] = self.base_fricw * self.friction_mult
-        # ECU raises the idle target when cold (fast idle) for stable warm-up
-        self.idle_target = self.cfg.idle_rpm * (1.0 + 0.55 * (1.0 - wf))
+        # ECU raises the idle target when cold (fast idle) for stable warm-up.
+        # Petrol fast-idles high (~+55%, carb/EFI warm-up enrichment); a
+        # diesel has no throttle losses or cat to light and idles cold at
+        # barely above its warm speed (~+12%) -- the old petrol-style +55%
+        # put a 850-rpm TDI at 1320 cold, which read as a broken idle.
+        raise_frac = 0.12 if self.cfg.diesel else 0.55
+        self.idle_target = self.cfg.idle_rpm * (1.0 + raise_frac * (1.0 - wf))
         # NB: cold enrichment is now applied as a richer phi command in
         # _control_update (the equivalence-ratio fuelling map), not by mutating
         # the stoichiometric AFR here.
