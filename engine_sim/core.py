@@ -465,6 +465,21 @@ def gas_step_q(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open,
         # quasi-1D pressure-on-walls force: p_i * (A_{i+1/2} - A_{i-1/2})
         mom[i] += inv * (d1[i] + p[i] * (aface[i + 1] - aface[i]))
         Ene[i] += inv * d2[i]
+        # turbulent wall friction (Darcy-Weisbach): dp/dx = f/D * rho u|u| / 2,
+        # f = 0.035 (Moody, smooth pipe, Re ~ 1e4-1e5), D from the local area.
+        # Quadratic in u: it bites on the loud wave fronts that ring the pipe's
+        # quarter-wave comb (the "plastic tube" coloration) and vanishes for
+        # small signals -- so it cannot kill the idle tone the way a stronger
+        # LINEAR loss would. Momentum sinks, Ene is untouched: the lost kinetic
+        # energy lands in heat automatically (Eint = Ene - kin). The flat damp
+        # below stays as the small-signal visco-thermal floor.
+        ui_ = mom[i] / rho[i]
+        if ui_ < 0.0:
+            ui_ = -ui_
+        fr = dt * 0.0155 / np.sqrt(area[i]) * ui_   # 0.035/(2*sqrt(4A/pi))
+        if fr > 0.5:
+            fr = 0.5
+        mom[i] -= fr * mom[i]
         # gentle wall damping (acoustic/viscous losses)
         mom[i] -= damp * mom[i]
         # ---- robust clamps (also catch any non-finite value) ----
