@@ -161,8 +161,25 @@ Landed since:
   fuel cut used to brake the overshoot); steady state unchanged-good
   (5.0L ±15, V12 ±9). idle_test's 4 s window reads the tail as ripple.
 
+Third round (user: release at 3200/2500 still racey; higher rpm OK):
+- Measured truth: overrun was AS LOUD as fired at same rpm; energy at
+  the gas-exchange pulse rate. TWO wrong things found:
+  1. MAP-hold dashpot was over-derived (ECUs hold the idle VALVE; real
+     overrun vacuum deepens with rpm) -> `78c4112` holds idle trim
+     instead: MAP 5-16 kPa falling, braking kept, slam softened.
+  2. Stock cars had NO CAT -- the main HF attenuator of any production
+     exhaust -> `2c511c0` cat brick: 5x face swell + LINEAR Poiseuille
+     channel damping (32 nu/d^2, 400 cpsi, no free constants). LINEAR
+     loss finally bites at small signal where Darcy can't. Front/rear
+     silencers also separated (real layout). Release-at-3200 now
+     QUIETER+darker than fired hold; V8 rumble kept; accel identical.
+- Dead end logged: splitting the boxes for "drone" (quarter-wave lock)
+  did NOT change the release bands -- the ring was gas-exchange pulse
+  rate, not the pipe column. Don't re-chase column drone for overrun.
+
 Queued next:
-1. USER LISTENS: 1.2 rev-release (dashpot verdict), V8 rumble.
+1. USER LISTENS: 1.2 rev-release (cat+dashpot verdict), V8 rumble,
+   any stock car (the cat re-voiced ALL non-straight-pipe presets).
 2. Muffler shell radiation (mass-law transmission from chamber cells) —
    derived replacement for the rejected synthetic body resonator.
 3. Per-cylinder exhaust primaries -> collector (full header geometry) —
