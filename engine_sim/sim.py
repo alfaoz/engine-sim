@@ -51,7 +51,7 @@ class EngineSim:
         self.rpm_gov = 0.0          # low-passed idle speed the governor regulates
         self._rpm_gov_prev = 0.0    # for the governor's (filtered) rate term
         self.torque = 0.0
-        self.audio_tap = np.zeros(8192, dtype=np.float64)   # ring of last output
+        self.audio_tap = np.zeros(2048, dtype=np.float64)   # ring of last output
         self._tap_pos = 0
         self._cb_buf = np.zeros(BLOCK, dtype=np.float64)     # reused audio out buffer
 
@@ -282,14 +282,11 @@ class EngineSim:
         # (e.g. the big tractor diesel) comfortably inside the real-time budget.
         base_cells = min(240, max(80, cfg.pipe_length / 0.012))
         N = int(np.clip(base_cells / nbanks, 56, 240))
-        pipe_area = math.pi / 4.0 * cfg.pipe_diameter ** 2
-        # acoustic end correction: an unflanged open pipe behaves ~0.61 radii
-        # longer than its physical length (Levine & Schwinger)
-        L_eff = cfg.pipe_length + 0.61 * (cfg.pipe_diameter / 2.0)
-        dx = L_eff / N
+        dx = cfg.pipe_length / N
         P[core.P_NCELLS] = N
         P[core.P_DX] = dx
         P[core.P_PIPELEN] = cfg.pipe_length
+        pipe_area = math.pi / 4.0 * cfg.pipe_diameter ** 2
         P[core.P_PIPEAREA] = pipe_area
 
         # ---- muffler chamber acoustics (geometry-derived, lumped) ----
@@ -410,7 +407,7 @@ class EngineSim:
             P[core.P_HT] = 1.15      # higher wall loss (cooler walls, CI mixing)
         P[core.P_WALLT] = self.T_metal      # wall temp tracks the metal (thermal model)
         P[core.P_DIESEL] = 1.0 if cfg.diesel else 0.0
-        P[core.P_DAMP] = 1.0        # wall-loss scale (1 = physical friction/heat)
+        P[core.P_DAMP] = 0.0015
         P[core.P_OUTGAIN] = 1.0 / 2600.0
         P[core.P_REDLINE] = cfg.redline_rpm
         P[core.P_RUNNING] = 0.0     # engine starts off — user cranks it
@@ -429,13 +426,10 @@ class EngineSim:
         # to ZERO on a refined 4+ cylinder petrol engine, which is smooth/creamy.
         # (Air-cooled/agricultural petrol fours would clatter too, but that needs a
         # per-engine flag; the cylinder heuristic covers the common cases.)
-        # the modal-body events (valve seats, slap) exist on EVERY engine, so a
-        # refined multi-cyl petrol keeps a subtle floor rather than zero.
         if cfg.diesel:
             self._clatter_on = 0.5 * float(np.clip(4.0 / ncyl, 0.5, 1.0))
         else:
-            self._clatter_on = max(
-                0.10, 0.34 * float(np.clip((4 - ncyl) / 3.0, 0.0, 1.0)))
+            self._clatter_on = 0.34 * float(np.clip((4 - ncyl) / 3.0, 0.0, 1.0))
         self._knock_on = 0.0 if cfg.diesel else 0.30
         P[core.P_CLATTER] = self._clatter_on if self.mix_clatter else 0.0
         P[core.P_OCTANE] = cfg.octane
@@ -466,10 +460,8 @@ class EngineSim:
         # back the level a big expansion chamber removes so presets aren't wildly
         # mismatched -- but only PARTLY (exp 0.18), since a big silencer really is
         # quieter, and the old 0.32 over-boosted big-muffler diesels into clipping.
-        # output scale: the radiated signal is physical Pa at a 1 m mic, so
-        # full-scale 1.0 ~= 40 Pa ~= 126 dB SPL (close-mic'd engine).
         muff_comp = self._muff_ratio ** 0.18
-        P[core.P_OUTGAIN] = (1.0 / 300.0) * self.bank_trim * muff_comp
+        P[core.P_OUTGAIN] = (1.0 / 2750.0) * self.bank_trim * muff_comp
 
         self.P = P
         self.N = N
@@ -526,15 +518,6 @@ class EngineSim:
         # per-cylinder trapped reference + knock state:
         # [T_ivc, P_ivc, Livengood-Wu integral, knocked, V_ivc, spare]
         self.cyl_knk = np.zeros((ncyl, 6))
-        # static per-cylinder combustion trim (fuelling/compression spread):
-        # the engine's permanent identity -- deterministic per geometry, so the
-        # same preset always has the same half-order signature (V8 burble,
-        # diesel lope), not a new lottery every run.
-        rng = np.random.default_rng(ncyl * 7919 + int(cfg.bore * 1e6) % 7919)
-        self.cyl_trim = 1.0 + 0.025 * rng.standard_normal(ncyl)
-        # per-cylinder cycle state: [AR(1) wander, current-cycle burn quality]
-        self.cyl_var = np.zeros((ncyl, 2))
-        self.cyl_var[:, 1] = 1.0
 
         rho0 = PATM / (R_AIR * TATM)
         self.rho = np.full((nbanks, N), rho0)
@@ -576,48 +559,12 @@ class EngineSim:
         self.run_aface = self._faces(self.run_area_a)
         self.run_wk = np.zeros((15, Nr))
 
-        # ---- physical pipe wall losses (per cell, from the local diameter) ----
-        # turbulent Darcy friction f/(2D) (1/m). Wall heat loss uses the
-        # REYNOLDS ANALOGY: its coefficient is the same f/(2D), and the core
-        # multiplies by the local |u| -- heat exchange rides on the forced
-        # convection, so a stopped pipe stops exchanging (no chimney pumping).
-        F_DARCY = 0.032
-        D_ex = np.sqrt(4.0 * self.ex_area / math.pi)
-        self.ex_fric = F_DARCY / (2.0 * D_ex)
-        self.ex_cool = self.ex_fric.copy()
-        D_in = np.sqrt(4.0 * self.in_area / math.pi)
-        self.in_fric = F_DARCY / (2.0 * D_in)
-        self.in_cool = self.in_fric.copy()
-        D_run = np.sqrt(4.0 * self.run_area_a / math.pi)
-        self.run_fric = F_DARCY / (2.0 * D_run)
-        self.run_cool = self.run_fric.copy()
-        # grid-scale HF dissipation per cell: a small boundary-layer base level
-        # everywhere, plus ABSORPTIVE PACKING inside the silencer chamber (the
-        # fibre wool of a real muffler eats high frequencies in the chamber but
-        # leaves the lows -- that's where the dark/refined exhaust tone comes
-        # from). A 2-stroke chamber is a REFLECTIVE tuned cone, so no packing.
-        HF_BASE = 0.02
-        HF_PACK = 0.16
-        self.ex_hf = np.full(N, HF_BASE)
-        if cfg.stroke_cycle == 4 and not self._straight:
-            chamber = self.ex_area > 2.5 * pipe_area
-            self.ex_hf[chamber] = HF_PACK
-        self.in_hf = np.full(nin, HF_BASE)
-        self.run_hf = np.full(Nr, HF_BASE)
-        # open-end reflection filter states (Levine-Schwinger termination):
-        # one per exhaust bank, one for the intake mouth, one per runner.
-        self.bc_ex = np.zeros(nbanks)
-        self.bc_in = np.zeros(1)
-        self.bc_run = np.zeros(ncyl)
-
         self.scope_p = np.full(N_SCOPE, PATM)
-        # output filter state: exhaust mdot-prev (0) + DC block (1,21), de-hash
-        # LPF (2,3), body/thump resonator (4,5); induction mdot-prev (6) + DC
-        # block (7,22), de-hash LPF (8,9); peak-limiter envelope (10) + gain
-        # (11); combustion-clatter resonators (12,13) and (14,15); knock ping
-        # (16,17); muffler chamber LP (18); clatter impact envelope (19)
-        # 24-35: modal-body mode states (6 SVFs); 36: impact contact-noise env
-        self.filt = np.zeros(40)
+        # output filter state: exhaust DC block (0,1), de-hash LPF (2,3),
+        # body/thump resonator (4,5); induction DC block (6,7), de-hash LPF (8,9);
+        # peak-limiter envelope (10) + gain (11); combustion-clatter resonators
+        # (12,13) and (14,15); knock ping (16,17); muffler chamber LP (18)
+        self.filt = np.zeros(20)
         self.filt[11] = 1.0          # limiter gain starts at unity
         self.P[core.P_MAP] = PATM
 
@@ -1047,17 +994,12 @@ class EngineSim:
                                self.rho, self.mom,
                                self.Ene, self.rho_in, self.mom_in, self.Ene_in,
                                self.run_mdot, self.fresh, self.cyl_knk,
-                               self.cyl_trim, self.cyl_var,
                                self.rho_r, self.mom_r, self.Ene_r,
                                self.src_rm, self.src_re,
                                out, self.scope_p, N_SCOPE, self.filt,
                                self.ex_area, self.ex_aface, self.ex_wk,
                                self.in_area, self.in_aface, self.in_wk,
-                               self.run_area_a, self.run_aface, self.run_wk,
-                               self.ex_fric, self.ex_cool, self.ex_hf,
-                               self.in_fric, self.in_cool, self.in_hf,
-                               self.run_fric, self.run_cool, self.run_hf,
-                               self.bc_ex, self.bc_in, self.bc_run)
+                               self.run_area_a, self.run_aface, self.run_wk)
             self.torque = float(t)
             self.rpm = self.st[core.S_OMEGA] * 60.0 / (2.0 * math.pi)
             self.v = float(self.st[core.S_V])

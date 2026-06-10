@@ -60,7 +60,7 @@ class EngineUI:
         self.SG_F = 96        # spectrogram frequency rows (0..8 kHz)
         self.SG_T = 160       # spectrogram time columns
         self.sgram = np.full((self.SG_F, self.SG_T), -90.0)
-        self._spec_win = np.hanning(4096)
+        self._spec_win = np.hanning(2048)   # matches the sim's audio-tap ring
 
     # ------------------------------------------------------------ config glue
     def current_edited_config(self) -> EngineConfig:
@@ -315,7 +315,7 @@ class EngineUI:
         self.sim.P[core.P_REDLINE] = dpg.get_value("redline")
         self.sim.P[core.P_OUTGAIN] = (1.0 / dpg.get_value("outscale")
                                       * getattr(self.sim, "bank_trim", 1.0))
-        self.sim.P[core.P_DAMP] = dpg.get_value("damp")  # wall-loss scale
+        self.sim.P[core.P_DAMP] = dpg.get_value("damp")
         self._mark_custom()
 
     def on_audio_toggle(self, s, v):
@@ -791,9 +791,9 @@ class EngineUI:
                                                  callback=self.on_mix_muffler,
                                                  tag="mix_muffler")
                                 dpg.add_text("   Tuning:", color=(170, 170, 170))
-                                self._num("outscale", "out Pa/unit", 300, 30, 3000,
+                                self._num("outscale", "out scale", 2600, 300, 20000,
                                           live=True)
-                                self._num("damp", "wall loss", 1.0, 0.0, 4.0,
+                                self._num("damp", "exh damping", 0.0015, 0.0, 0.02,
                                           live=True)
                                 dpg.add_slider_float(tag="backfire",
                                                      label="crackle",
@@ -1177,10 +1177,10 @@ class EngineUI:
             dpg.set_value("wav_series",
                           [list(range(1024)), wav[-1024:].tolist()])
             dpg.set_axis_limits("wav_y", -1.05, 1.05)
-            w = wav[-4096:]
-            sp = np.abs(np.fft.rfft(w * self._spec_win)) / 1024.0
+            w = wav[-2048:]
+            sp = np.abs(np.fft.rfft(w * self._spec_win)) / 512.0
             db = 20.0 * np.log10(sp + 1e-7)
-            fr = np.fft.rfftfreq(4096, 1.0 / SAMPLE_RATE)
+            fr = np.fft.rfftfreq(2048, 1.0 / SAMPLE_RATE)
             m = fr <= 8000.0
             dpg.set_value("spec_series", [fr[m].tolist(), db[m].tolist()])
             dpg.set_axis_limits("spec_y", -110.0, -5.0)

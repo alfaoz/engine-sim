@@ -82,9 +82,6 @@ def run(N=200, tau=0.2):
     aface = np.ones(N + 1)
     wk = np.zeros((15, N))
     src_m = np.zeros(N); src_E = np.zeros(N)
-    # no wall losses / no HF smoothing: pure solver vs analytic solution
-    fric = np.zeros(N); cool = np.zeros(N); hf = np.zeros(N)
-    refl = np.zeros(1)
 
     t = 0.0
     while t < t_end:
@@ -96,8 +93,7 @@ def run(N=200, tau=0.2):
         if t + dt > t_end:
             dt = t_end - t
         gas_step_q(rho, mom, Ene, N, dx, dt, G, R, 0.1 * alpha, T_open,
-                   0.1 * alpha, T_open, src_m, src_E, area, aface, wk,
-                   fric, cool, 0.0, 0.0, T_open, hf, refl, 0.5)
+                   0.1 * alpha, T_open, 0.0, src_m, src_E, area, aface, wk, 0.0)
         t += dt
 
     u = mom / rho / sa                                # back to nondim velocity
