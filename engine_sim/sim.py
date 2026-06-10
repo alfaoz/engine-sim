@@ -633,12 +633,30 @@ class EngineSim:
         # survival per pass.)
         self.pk_ex = np.zeros(N)
         if cfg.stroke_cycle == 4 and not self._straight:
-            # packing fills the SHELL span (0.50..0.88+cones), neck included:
-            # a real box's internals run wall to wall. The old area-based
-            # rule left the inter-chamber neck unpacked -- a high-Q cavity
-            # between two near-perfect mirrors.
+            # packing fills each silencer SHELL wall-to-wall (cones
+            # included), set by the spans the area profile recorded
             xc_pk = (np.arange(N) + 0.5) / N
-            self.pk_ex[(xc_pk > 0.50) & (xc_pk < 0.94)] = 0.006
+            for lo, hi in self._pack_spans:
+                self.pk_ex[(xc_pk >= lo) & (xc_pk <= hi)] = 0.006
+            if self._cat_span is not None:
+                # cat brick: laminar (Poiseuille) channel damping. A 400 cpsi
+                # monolith has ~1.1 mm hydraulic channels; fully-developed
+                # laminar flow loses momentum at alpha = 32*nu/d^2 (1/s),
+                # frequency-flat and LINEAR -- it bites at any signal level,
+                # exactly what the quadratic Darcy law can't do. nu from
+                # Sutherland at ~800 K cat operating temperature. Converted
+                # to the solver's per-substep fraction with the exact
+                # dt_gas the core will use (same CFL formula).
+                d_ch = 1.1e-3
+                T_cat = 800.0
+                mu_c = (1.716e-5 * (T_cat / 273.15) ** 1.5
+                        * (273.15 + 110.4) / (T_cat + 110.4))
+                nu_c = mu_c * R_AIR * T_cat / PATM
+                alpha_cat = 32.0 * nu_c / (d_ch * d_ch)
+                nsub = int(1150.0 * (1.0 / SAMPLE_RATE) / (0.8 * dx)) + 1
+                dt_gas = (1.0 / SAMPLE_RATE) / nsub
+                lo, hi = self._cat_span
+                self.pk_ex[(xc_pk >= lo) & (xc_pk <= hi)] = alpha_cat * dt_gas
         self.pk_in = np.zeros(max(1, Ni))
         self.pk_run = np.zeros(self.Nr)
 
@@ -689,6 +707,8 @@ class EngineSim:
         cfg = self.cfg
         L = cfg.pipe_length
         xc = (np.arange(N) + 0.5) / N
+        self._pack_spans = []          # set by the silenced branch below
+        self._cat_span = None          # set when a cat brick is built
         if cfg.stroke_cycle == 2:
             # 2-stroke tuned pipe: header -> diverging cone -> belly -> converging
             # cone -> stinger. The belly/cone reflections are the "braaap" and the
@@ -721,26 +741,48 @@ class EngineSim:
             A_ch = self._A_ch                            # sized in _build
             A_tail = 0.8 * pipe_area
             s = max(0.03, 2.5 / N)        # one resolvable transition width
-            flat = 0.38 - 5.0 * s         # chamber zone 0.50..0.88 minus cones
+            # ---- catalytic converter brick (every stock 4-stroke has one;
+            # straight-pipe presets are the catless race systems). The brick
+            # is a 400-cpsi laminar honeycomb: an area swell to the monolith
+            # face (~5x pipe, standard face-velocity sizing) whose cells get
+            # LINEAR Poiseuille channel damping (computed in _build) -- the
+            # main high-frequency attenuator of a production exhaust, which
+            # is why "catted" cars never bark. Sits right after the
+            # collector (close-coupled/underfloor position).
+            c0 = 0.40                      # injection zone ends by 0.40
+            Lc = max(s, 0.12 / max(L, 0.6))             # ~12 cm brick
+            cat_end = c0 + Lc + 2.0 * s
+            self._cat_span = (c0, cat_end)
+            A_cat = 5.0 * pipe_area
+            flat = (0.88 - cat_end) - 5.0 * s   # box budget minus cones
             if flat > 4.0 * s:
-                # two staged chambers, lengths 1 : 1.618
-                L1 = flat / 2.618
-                L2 = flat - L1
-                p1 = 0.50 + 2.0 * s       # cone up done -> ch1
-                p2 = p1 + L1              # ch1 done
-                p3 = p2 + s               # cone down -> neck
-                p4 = p3 + s               # neck done
-                p5 = p4 + s               # cone up -> ch2
-                p6 = p5 + L2              # = 0.88, ch2 done
-                xs = [0.0, 0.50, p1, p2, p3, p4, p5, p6,
-                      p6 + 2.0 * s, 1.0]
-                ars = [pipe_area, pipe_area, A_ch, A_ch, pipe_area,
-                       pipe_area, A_ch, A_ch, A_tail, A_tail]
+                # FRONT RESONATOR + REAR MUFFLER, separated mid-pipe (the
+                # real OEM layout): staged TL, lengths 1:1.618 so the pass
+                # bands never align.
+                L1 = flat / 2.618          # front resonator (smaller box)
+                L2 = flat - L1             # rear muffler
+                f0 = cat_end + s           # front box cone-up start
+                p1 = f0 + 2.0 * s          # cone up done -> front box
+                p2 = p1 + L1               # front box done
+                r0 = 0.88 - L2 - 2.0 * s   # rear muffler cone-up start
+                xs = [0.0, c0, c0 + s, c0 + s + Lc, cat_end,
+                      f0, p1, p2, p2 + s, r0,
+                      r0 + 2.0 * s, 0.88, 0.88 + 2.0 * s, 1.0]
+                ars = [pipe_area, pipe_area, A_cat, A_cat, pipe_area,
+                       pipe_area, A_ch, A_ch, pipe_area, pipe_area,
+                       A_ch, A_ch, A_tail, A_tail]
+                # absorptive packing = the two shells (cones included); the
+                # mid-pipe between boxes is bare tube, NOT packed
+                self._pack_spans = [(f0, p2 + s), (r0, 0.88 + s)]
             else:
                 # grid too coarse for staging (heavily split multi-bank
-                # exotics): single chamber, transitions still >= 2.5 cells
-                xs = [0.0, 0.50, 0.50 + 2.0 * s, 0.88, 0.88 + 2.0 * s, 1.0]
-                ars = [pipe_area, pipe_area, A_ch, A_ch, A_tail, A_tail]
+                # exotics): cat + single chamber, transitions >= 2.5 cells
+                b0 = cat_end + s
+                xs = [0.0, c0, c0 + s, c0 + s + Lc, cat_end,
+                      b0, b0 + 2.0 * s, 0.88, 0.88 + 2.0 * s, 1.0]
+                ars = [pipe_area, pipe_area, A_cat, A_cat, pipe_area,
+                       pipe_area, A_ch, A_ch, A_tail, A_tail]
+                self._pack_spans = [(b0, 0.88 + s)]
         prof = np.interp(xc, xs, ars)
         # slope limit: adjacent cells never differ by more than 1.6x, so no
         # cone is ever steeper than the grid resolves (the quasi-1D p*dA
