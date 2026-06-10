@@ -144,9 +144,25 @@ Landed since (one commit each, gates green, EARS PENDING):
   muffler floor scales with engine, packing fills the shell span
   positionally (area rule left the neck as a high-Q mirror cavity).
 
+Second listen verdicts: city 1.2 idle GOOD; overrun/rev-release still
+racey -> diagnosed NOT exhaust: DFCO pulled MAP to 3 kPa and every EVO
+slammed atmosphere into the vacuum (overrun was LOUDER than firing,
+rms 0.049 vs 0.019). Muffler builder UX: user read 0 as "no muffler"
+(it means auto box) -> relabeled.
+
+Landed since:
+- `cc4e836` decel dashpot: DFCO holds idle-like MAP (~20 kPa) via the
+  governor's own trim * sqrt(rpm/idle). Overrun >1.2 kHz hash -4..-6 dB,
+  decay is burble not vacuum slam. EARS PENDING.
+- `291be11` launch clutch slips to hold rpm (TCU-style) + 2 s post-start
+  DFCO inhibit. Fixes the 1.0L hatch knife-edge (DNF'd accel.py at
+  baseline!); hatch min-rpm 670 vs 230, all accel times within noise.
+  NOTE: first idle settle is ~2 s slower now (the accidental post-start
+  fuel cut used to brake the overshoot); steady state unchanged-good
+  (5.0L ±15, V12 ±9). idle_test's 4 s window reads the tail as ripple.
+
 Queued next:
-1. USER LISTENS: city car (racey fixed?), V8 (rumble), the pair
-   cd4a112+45f92eb re-voiced every silenced 4-stroke.
+1. USER LISTENS: 1.2 rev-release (dashpot verdict), V8 rumble.
 2. Muffler shell radiation (mass-law transmission from chamber cells) —
    derived replacement for the rejected synthetic body resonator.
 3. Per-cylinder exhaust primaries -> collector (full header geometry) —
