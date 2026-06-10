@@ -584,9 +584,8 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
         run_leff = run_len + 0.85 * np.sqrt(run_area / np.pi)
         inert_k = run_area / run_leff        # inertance coupling (kg/s per Pa.s)
         ram_amin = 0.02 * Ain                # below this valve area, column halts
-        col_mmax = 500.0 * run_area          # column speed cap (m/s) * area
     else:
-        run_leff = 1.0; inert_k = 0.0; ram_amin = 0.0; col_mmax = 0.0
+        run_leff = 1.0; inert_k = 0.0; ram_amin = 0.0
     # mode 2: per-cylinder 1D Euler runner. Each cylinder breathes from its OWN
     # runner head cell (which carries that runner's pressure wave); the runner
     # mouth (tail cell) is open to the plenum at MAP. The ram peak rpm and its
@@ -688,6 +687,13 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     # Woschni correlation, so wall heat loss now tracks pressure, speed and load.
     stroke_m = 2.0 * r                       # piston stroke
     bore_pow = bore_m ** (-0.2)
+    # ring blowby leak area: compression-ring end gap (service spec ~0.0035
+    # m per m of bore) x ring-to-groove side clearance (~50 um spec). Loses
+    # ~0.2% of the charge per cycle at speed (real engines: ~1%), and lets a
+    # PARKED pressurized cylinder leak down in ~a minute like a real one --
+    # without it a stalled engine held tens of bar forever, primed to blast
+    # the intake duct through any valve that parked open.
+    A_blow = 0.0035 * bore_m * 5.0e-5
     wos_c2 = 3.24e-3                          # combustion velocity coefficient
     wos_scale = ht                           # P_HT repurposed as the Woschni gain
     PI_INV = 1.0 / np.pi
@@ -1082,10 +1088,18 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     # column momentum: plenum pressure minus cylinder minus the
                     # valve loss needed to pass the current flow
                     mdot += dt * inert_k * (MAP - Pc - dP_valve)
-                    if mdot > col_mmax:
-                        mdot = col_mmax
-                    elif mdot < -col_mmax:
-                        mdot = -col_mmax
+                    # the valve is a compressible restriction: the column can
+                    # never pass more than the CHOKED orifice flow for the
+                    # current upstream state (the old 500 m/s cap let a parked
+                    # pressurized cylinder drive supersonic flow into the duct)
+                    if mdot >= 0.0:
+                        cap_m = orifice_mdot(MAP, Tman, 0.0, A_v, Cd, g, R)
+                        if mdot > cap_m:
+                            mdot = cap_m
+                    else:
+                        cap_m = orifice_mdot(Pc, T, 0.0, A_v, Cd, g, R)
+                        if mdot < -cap_m:
+                            mdot = -cap_m
                     run_mdot[c] = mdot
                     md = mdot * dt
                     if md >= 0.0:
@@ -1195,6 +1209,14 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                             ma_p -= burn_p * AFR
                             pipe_chem[cb, 0] = mf_p if mf_p > 0.0 else 0.0
                             pipe_chem[cb, 1] = ma_p if ma_p > 0.0 else 0.0
+
+            # ---- ring blowby: leak past the rings to the crankcase (vented
+            # to atmosphere); tiny when running, but it is what lets a parked
+            # cylinder relax to ambient instead of staying loaded forever ----
+            if Pc > patm:
+                md_bb = orifice_mdot(Pc, T, patm, A_blow, Cd, g, R) * dt
+                dm_ex += md_bb
+                dH -= md_bb * _h_of_T(T, cv0_c, b_c, R)
 
             # ---- update cylinder state (energy & mass balance) ----
             # internal energy uses the temperature-dependent cv(T); the new temp is
