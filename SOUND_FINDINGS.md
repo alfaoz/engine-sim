@@ -177,9 +177,35 @@ Third round (user: release at 3200/2500 still racey; higher rpm OK):
   did NOT change the release bands -- the ring was gas-exchange pulse
   rate, not the pipe column. Don't re-chase column drone for overrun.
 
+Fourth round — THE REPRODUCTION (and two process failures):
+- Sound-lab Muffler checkbox had been wired to the dead P_MUFFLP filter
+  since the geometry silencer landed: the user's A/B instrument was
+  disconnected and nobody noticed. Fixed `45db16a`: toggle now swaps
+  real geometry live (ON->OFF measured +21 dB). Induction checkbox A/B
+  by user: raceyness NOT induction. Clatter is 0 on 4-cyl petrol.
+- ALL my overrun probes were bench-neutral coasts (rpm falls through
+  the band in <1 s). Driving IN GEAR (the user's condition): sustained
+  overrun at 3300 rpm measures +10 dB LOUDER than WOT power at the
+  same revs (rms 0.056 vs 0.017), brighter in every band. Real cars
+  are 15-20 dB QUIETER on overrun. The symptom was always reproducible
+  -- in the right conditions. BENCH PROBES DO NOT COUNT FOR OVERRUN.
+- Exhaust sources were still once-per-sample impulses (the intake buzz
+  bug, never fixed on the exhaust side) -> spread `6ce65c1`; small.
+
+DIAGNOSIS standing: at EVO on deep-vacuum overrun the pipe (1 atm)
+slams ~0.3 g into the ~8 kPa cylinder, the piston pushes it back out
+-- a ±0.3 g/cycle oscillating pump at the firing rate, injected
+DIRECTLY into the shared 1D pipe cell. A real engine has the exhaust
+PORT + PRIMARY RUNNER volume (~0.3-0.5 L/cyl) between valve and
+collector that low-passes this slosh; we have zero buffer. Candidate
+fix = lumped per-cylinder exhaust port/runner (the deferred
+per-cylinder-primaries plan in cheap 1-state form, like intake
+RAM_MODE 1). Re-voices every preset (it is the header) -> goes in
+ALONE, user listens.
+
 Queued next:
-1. USER LISTENS: 1.2 rev-release (cat+dashpot verdict), V8 rumble,
-   any stock car (the cat re-voiced ALL non-straight-pipe presets).
+1. Per-cylinder lumped exhaust port buffer (above) -- pending user GO.
+2. USER LISTENS after each rung as always.
 2. Muffler shell radiation (mass-law transmission from chamber cells) —
    derived replacement for the rejected synthetic body resonator.
 3. Per-cylinder exhaust primaries -> collector (full header geometry) —
