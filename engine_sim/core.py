@@ -3,8 +3,9 @@ Real-time engine core: crank kinematics + 0D filling/emptying cylinder
 thermodynamics + 1D compressible (Euler) exhaust gas dynamics.
 
 Everything in the hot path is numba-njit compiled so a whole audio block can be
-advanced sample-by-sample at 48 kHz in real time. The pressure wave arriving at
-the open (tailpipe) end of the 1D exhaust IS the audio signal.
+advanced sample-by-sample at 48 kHz in real time. The audio signal is the
+monopole radiation of the tailpipe orifice: d(mdot_exit)/dt / (4*pi*r) at a
+listener r metres away (and the same for the intake mouth).
 
 State layout
 ------------
@@ -594,8 +595,10 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     ht = P[P_HT]; wallT = P[P_WALLT]
     diesel = P[P_DIESEL] > 0.5
     damp = P[P_DAMP]
+    # outgain = 1/(4*pi*r_mic*p_fullscale): together with the d(mdot)/dt tap
+    # below it converts the tailpipe's mass-flow derivative into the acoustic
+    # pressure at the listener (monopole radiation), normalised to full scale.
     outgain = P[P_OUTGAIN]
-    flow_gain = outgain * 0.0015      # turbulent tailpipe flow-noise level
     redline = P[P_REDLINE]
     running = P[P_RUNNING] > 0.5
     starter = P[P_STARTER]
@@ -1225,11 +1228,11 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 scope_p[idx] = Pc
 
         # ---- exhaust gas dynamics substeps (avg tailpipe = anti-alias) ----
-        # Each bank is advanced as its own 1D pipe; the summed tailpipe gauge
-        # pressure across banks IS the voiced signal -- the bank-to-bank cadence
-        # (and cross-plane bank split) gives the V8/W16 rumble.
-        Pt_acc = 0.0
-        flow_acc = 0.0
+        # Each bank is advanced as its own 1D pipe. The radiated sound is the
+        # summed banks' exit MASS-FLOW (a monopole source: what the pipe blows
+        # into the air is what you hear, as d(mdot)/dt at the listener) -- the
+        # bank-to-bank cadence (cross-plane bank split) gives the V8/W16 rumble.
+        mdot_acc = 0.0
         for _ in range(nsub):
             for b in range(nbanks):
                 gas_step_q(rho[b], mom[b], Ene[b], N, dx, dt_gas, gex, Rex,
@@ -1241,15 +1244,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     src_m[b, k] = 0.0
                     src_E[b, k] = 0.0
             for b in range(nbanks):
-                ut = mom[b, N - 1] / rho[b, N - 1]
-                Pt = (gex - 1.0) * (Ene[b, N - 1] - 0.5 * rho[b, N - 1] * ut * ut)
-                Pt_acc += Pt - patm        # gauge, summed over banks
-                # turbulent FLOW noise: the broadband "rush" of gas through the
-                # tailpipe (pipe-flow turbulence ~ dynamic pressure rho*u^2). This
-                # is what a real exhaust has on top of the tonal firing pulses --
-                # without it the solver is a pure-tone organ pipe ("tubey"). It
-                # scales with velocity^2 so it's silent at idle and roars at WOT.
-                flow_acc += rho[b, N - 1] * ut * abs(ut) * np.random.standard_normal()
+                mdot_acc += mom[b, N - 1] * fa_ex[N]   # rho*u*A at the exit
 
         # ---- pipe chemistry transport: the unburnt-fuel / free-O2 inventories
         # wash out of the tailpipe with the actual exhaust flow, so their
@@ -1291,7 +1286,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
         # pressure wave radiating from the mouth IS the induction "suck"/honk,
         # and it rises with boost -> the turbo's intake character. Loudness
         # scales with airflow automatically (big draw at WOT, tiny at idle).
-        Pin_acc = 0.0
+        mdot_in_acc = 0.0
         if Ni > 0 and ingain > 0.0:
             # sound-only runner: excited by the real valve draw, open at the
             # mouth to the boost/airbox reservoir which refills it. The draw is
@@ -1305,9 +1300,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 gas_step_q(rho_in, mom_in, Ene_in, Ni, dx_in, dt_gas_in, g, R,
                            patm, Tatm, Pboost, Tman, damp_in, src_in_m, src_in_E,
                            pa_in, fa_in, wk_in, 0.12)
-                uin = mom_in[Ni - 1] / rho_in[Ni - 1]
-                Pin = (g - 1.0) * (Ene_in[Ni - 1] - 0.5 * rho_in[Ni - 1] * uin * uin)
-                Pin_acc += Pin
+                mdot_in_acc += mom_in[Ni - 1] * fa_in[Ni]   # mouth mass flow
 
         # ---- turbocharger shaft dynamics ----
         # Turbine harvests exhaust enthalpy flux; compressor work loads the
@@ -1450,8 +1443,14 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             theta = _wrap(theta, cyc)
         torque_acc += Tgas_torque
 
-        # ---- audio output: voiced tailpipe gauge pressure (summed banks) ----
-        raw = Pt_acc / nsub + flow_gain * (flow_acc / nsub)
+        # ---- audio output: monopole radiation from the tailpipe orifice ----
+        # p(listener) = d(mdot_exit)/dt / (4*pi*r): an unbaffled open pipe end
+        # radiates as a point source of volume flow; differentiating the exit
+        # mass flow gives the far-field pressure. The 1/(4*pi*r) and the
+        # full-scale Pa reference both live in outgain (set in sim._build).
+        mdot_t = mdot_acc / nsub
+        raw = (mdot_t - filt[20]) * sr      # d(mdot)/dt  (kg/s^2)
+        filt[20] = mdot_t
         # DC blocker (removes the static offset/thump)
         hp = raw - filt[0] + 0.999 * filt[1]
         filt[0] = raw
@@ -1485,7 +1484,9 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             # discrete mechanical knocks whose RATE rises with rpm -- so revving
             # speeds up a thrash instead of swelling a fixed tone (the old tonal
             # resonator was what sounded fake on the overrun/rev).
-            kick = clk_hit * outgain * 0.09
+            # level anchored to the pre-radiation-tap voicing (outgain was
+            # ~1/2750 then); the block's own radiation model can replace this
+            kick = clk_hit * (0.09 / 2750.0)
             clk_env = filt[19] * clk_decay
             if kick > clk_env:                            # peak-follow, don't sum
                 clk_env = kick
@@ -1520,12 +1521,15 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             filt[18] = ml
             sig = ml
 
-        # ---- induction (intake-mouth) signal: DC-block + de-hash, then mix ----
+        # ---- induction (intake-mouth) signal: same monopole tap as the
+        # exhaust (d(mdot)/dt at the duct mouth), DC-block + de-hash, then mix.
         # NB: this path MUST be de-hashed like the exhaust, else the 1D duct's
         # numerical HF hash leaks through as an "electric buzz" that grows with
         # rpm. A 2-pole lowpass (SVF) removes it and softens the intake tone.
         if Ni > 0:
-            raw_in = Pin_acc / nsub_in - patm
+            mdot_i = mdot_in_acc / nsub_in
+            raw_in = (mdot_i - filt[21]) * sr
+            filt[21] = mdot_i
             hp_in = raw_in - filt[6] + 0.999 * filt[7]
             filt[6] = raw_in
             filt[7] = hp_in

@@ -25,6 +25,8 @@ TINT = 315.0
 
 SAMPLE_RATE = 48000
 BLOCK = 512
+MIC_R = 2.0            # listener distance from the tailpipe/engine (m)
+P_FULLSCALE = 20.0     # digital full scale = 20 Pa = 120 dB SPL (pain threshold)
 N_SCOPE = 720          # cylinder-pressure scope resolution (per cycle)
 TAMB = 293.0           # ambient air / cold-soak temperature (K, ~20 C)
 T_THERMOSTAT = 361.0   # thermostat opening temperature (K, ~88 C)
@@ -95,6 +97,7 @@ class EngineSim:
         self.mix_clatter = True    # combustion/mechanical clatter (engine body noise)
         self.mix_knock = False     # spark-knock "ping" (petrol)
         self.mix_muffler = True    # muffler HF transmission loss
+        self.mic_r = MIC_R         # listener distance (m); the UI can move it
         self._clatter_on = 0.0
         self._knock_on = 0.0
         self._muff_on = 0.0
@@ -408,7 +411,7 @@ class EngineSim:
         P[core.P_WALLT] = self.T_metal      # wall temp tracks the metal (thermal model)
         P[core.P_DIESEL] = 1.0 if cfg.diesel else 0.0
         P[core.P_DAMP] = 0.0015
-        P[core.P_OUTGAIN] = 1.0 / 2600.0
+        P[core.P_OUTGAIN] = self.out_gain()
         P[core.P_REDLINE] = cfg.redline_rpm
         P[core.P_RUNNING] = 0.0     # engine starts off — user cranks it
         P[core.P_STARTER] = 0.0
@@ -455,14 +458,9 @@ class EngineSim:
         for c in range(ncyl):
             cyl_bank[c] = min(nbanks - 1, c * nbanks // ncyl)
         self.cyl_bank = cyl_bank
-        # summing banks adds level; trim output gain so V/W engines don't clip
-        self.bank_trim = 1.0 / (1.0 + 0.35 * (nbanks - 1))
-        # muffler loudness compensation (see _build muffler section): partly boost
-        # back the level a big expansion chamber removes so presets aren't wildly
-        # mismatched -- but only PARTLY (exp 0.18), since a big silencer really is
-        # quieter, and the old 0.32 over-boosted big-muffler diesels into clipping.
-        muff_comp = self._muff_ratio ** 0.18
-        P[core.P_OUTGAIN] = (1.0 / 2750.0) * self.bank_trim * muff_comp
+        # No bank-count trim and no muffler loudness compensation any more:
+        # with the radiation tap, two tailpipes really are louder than one and
+        # a big silencer really is quieter -- preset loudness is now physical.
 
         self.P = P
         self.N = N
@@ -568,8 +566,10 @@ class EngineSim:
         # output filter state: exhaust DC block (0,1), de-hash LPF (2,3),
         # body/thump resonator (4,5); induction DC block (6,7), de-hash LPF (8,9);
         # peak-limiter envelope (10) + gain (11); combustion-clatter resonators
-        # (12,13) and (14,15); knock ping (16,17); muffler chamber LP (18)
-        self.filt = np.zeros(20)
+        # (12,13) and (14,15); knock ping (16,17); muffler chamber LP (18);
+        # clatter impact envelope (19); prev exhaust/intake mdot for the
+        # radiation-tap derivative (20, 21)
+        self.filt = np.zeros(22)
         self.filt[11] = 1.0          # limiter gain starts at unity
         self.P[core.P_MAP] = PATM
 
@@ -622,6 +622,16 @@ class EngineSim:
         return np.interp(xc, xs, ars)
 
     # ------------------------------------------------------------- live tuning
+    def out_gain(self):
+        """The ONE output-gain formula (build and live UI both use it):
+        monopole radiation at mic_r metres, full scale = P_FULLSCALE Pa."""
+        r = self.mic_r if self.mic_r > 0.25 else 0.25
+        return 1.0 / (4.0 * math.pi * r * P_FULLSCALE)
+
+    def set_mic_distance(self, r):
+        self.mic_r = float(np.clip(r, 0.25, 20.0))
+        self.P[core.P_OUTGAIN] = self.out_gain()
+
     def set_throttle(self, v):
         self.pedal = float(np.clip(v, 0.0, 1.0))
 

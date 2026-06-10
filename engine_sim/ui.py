@@ -313,8 +313,9 @@ class EngineUI:
         self.sim.P[core.P_IGN] = math.radians(cyc_deg - dpg.get_value("ign"))
         self.sim.P[core.P_BURN] = math.radians(dpg.get_value("burn"))
         self.sim.P[core.P_REDLINE] = dpg.get_value("redline")
-        self.sim.P[core.P_OUTGAIN] = (1.0 / dpg.get_value("outscale")
-                                      * getattr(self.sim, "bank_trim", 1.0))
+        # mic distance: same formula as the build path (sim.out_gain), so the
+        # live and build gains can never diverge again
+        self.sim.set_mic_distance(dpg.get_value("micdist"))
         self.sim.P[core.P_DAMP] = dpg.get_value("damp")
         self._mark_custom()
 
@@ -791,7 +792,7 @@ class EngineUI:
                                                  callback=self.on_mix_muffler,
                                                  tag="mix_muffler")
                                 dpg.add_text("   Tuning:", color=(170, 170, 170))
-                                self._num("outscale", "out scale", 2600, 300, 20000,
+                                self._num("micdist", "mic dist (m)", 2.0, 0.5, 10.0,
                                           live=True)
                                 self._num("damp", "exh damping", 0.0015, 0.0, 0.02,
                                           live=True)
