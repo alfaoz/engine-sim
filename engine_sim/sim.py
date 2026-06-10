@@ -414,8 +414,8 @@ class EngineSim:
         P[core.P_STARTER] = 0.0
         P[core.P_LPF] = 0.55        # ~6.5 kHz one-pole output lowpass
         P[core.P_NOISE] = 0.06      # combustion cycle-to-cycle roughness
-        P[core.P_POP] = 0.0         # overrun backfire intensity (set live)
-        P[core.P_AFTERFIRE] = 0.0   # rich afterfire intensity (set live)
+        P[core.P_POP] = 0.0         # unused (pops are now pipe chemistry)
+        P[core.P_AFTERFIRE] = 0.0   # unburnt-fuel survival fraction (set live)
         self.backfire = 0.3         # crackle/afterfire amount (overrun pops + rich flames)
         # fuelling / ignition / mechanical noise (set live each block)
         P[core.P_FUELCUT] = 0.0     # DFCO injection cut
@@ -518,6 +518,10 @@ class EngineSim:
         # per-cylinder trapped reference + knock state:
         # [T_ivc, P_ivc, Livengood-Wu integral, knocked, V_ivc, spare]
         self.cyl_knk = np.zeros((ncyl, 6))
+        # pipe chemistry: per-cylinder [fuel_frac, air_frac, port wall-film kg]
+        # and per-bank pipe inventories [unburnt fuel kg, free-O2-bearing air kg]
+        self.cyl_chem = np.zeros((ncyl, 3))
+        self.pipe_chem = np.zeros((nbanks, 2))
 
         rho0 = PATM / (R_AIR * TATM)
         self.rho = np.full((nbanks, N), rho0)
@@ -855,16 +859,11 @@ class EngineSim:
                 phi += 0.035 * math.sin(self.lambda_phase)
             P[core.P_PHI] = phi
 
-        # ---- afterfire / crackle (one knob drives both mechanisms) ----
-        # Overrun pops (lean, decel): on a closed throttle above idle. Rich
-        # afterfire (over-fuel flames): whenever the petrol mixture is rich, the
-        # core fires it off a hot pipe. self.backfire is the user "crackle/flame"
-        # amount; the decel pops also scale with rpm (more violent higher up).
-        pop = 0.0
-        if self.state == "running" and self.pedal < 0.06 and rpm > idle * 1.8:
-            pop = float(np.clip((rpm - idle * 1.8) / max(1.0, cfg.redline_rpm),
-                                0.0, 1.0)) * self.backfire
-        P[core.P_POP] = pop
+        # ---- afterfire / crackle ----
+        # self.backfire is the fraction of the cylinders' unburnt surplus fuel
+        # that survives into the pipe un-oxidized (exhaust/cat design). Whether
+        # and when it POPS is decided in the core by the pipe's real fuel + O2
+        # inventories and temperature -- there is no pop probability any more.
         P[core.P_AFTERFIRE] = self.backfire if not cfg.diesel else 0.0
 
         # ---- intake feed: set throttle area + PRE-compressor feed pressure ----
@@ -994,6 +993,7 @@ class EngineSim:
                                self.rho, self.mom,
                                self.Ene, self.rho_in, self.mom_in, self.Ene_in,
                                self.run_mdot, self.fresh, self.cyl_knk,
+                               self.cyl_chem, self.pipe_chem,
                                self.rho_r, self.mom_r, self.Ene_r,
                                self.src_rm, self.src_re,
                                out, self.scope_p, N_SCOPE, self.filt,

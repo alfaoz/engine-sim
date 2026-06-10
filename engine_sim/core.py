@@ -484,7 +484,7 @@ def gas_step_q(rho, mom, Ene, N, dx, dt, g, R, patm, Tatm, p_open, T_open,
 @njit(cache=True, fastmath=True)
 def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                    rho, mom, Ene, rho_in, mom_in, Ene_in,
-                   run_mdot, fresh, cyl_knk,
+                   run_mdot, fresh, cyl_knk, cyl_chem, pipe_chem,
                    rho_r, mom_r, Ene_r, src_rm, src_re,
                    out_audio, scope_p, n_scope, filt,
                    pa_ex, fa_ex, wk_ex,
@@ -601,8 +601,22 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     starter = P[P_STARTER]
     lpf = P[P_LPF]
     noise = P[P_NOISE]
-    pop = P[P_POP]
-    afterfire = P[P_AFTERFIRE]   # rich-running afterfire (over-fuel flames/pops)
+    # afterfire knob = fraction of the cylinder's UNBURNT surplus fuel that
+    # survives into the exhaust pipe un-oxidized (0 = everything burns off /
+    # catalytic exhaust, 1 = race exhaust). Pops are no longer dice rolls: the
+    # pipe carries real unburnt-fuel and free-O2 inventories (pipe_chem) and
+    # deflagrates them when fuel + oxygen + autoignition temperature coexist.
+    afterfire = P[P_AFTERFIRE]
+    T_AIT = 550.0    # gasoline vapour autoignition ~280 C (Kirk-Othmer)
+    T_AFT = 2300.0   # adiabatic flame temperature of gasoline-air (~2300 K):
+    #                  a deflagration cannot heat the local gas past this, which
+    #                  bounds each pop's energy deposit physically
+    # port wall-film fuel (Aquino X-tau transient-fuelling model): fraction X
+    # of each injection wets the port walls and re-evaporates with time
+    # constant tau (~0.6 s warm). It is what keeps feeding unburnt fuel into
+    # the exhaust for a while after a fuel cut -> the decaying overrun crackle.
+    X_FILM = 0.30
+    inv_tau_film = 1.0 / 0.6
     fuelcut = P[P_FUELCUT] > 0.5     # DFCO / overrun injection cut
     phi_cmd = P[P_PHI]               # commanded equivalence ratio (petrol)
     if phi_cmd <= 0.0:
@@ -619,11 +633,6 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
     # load and only detonate when lugged, over-boosted, or fed low octane.
     knock_scale = 4.0
     pipe_area = P[P_PIPEAREA]
-    cell_vol = dx * pipe_area
-    # energy per overrun re-ignition event, scaled to ONE cell's volume so the
-    # local pressure rise stays bounded (~a few atm) and can't blow up the 1D
-    # solver into a checkerboard, however big the engine or fine the grid.
-    pop_burst = patm * cell_vol * 6.0
     if lpf <= 0.0:
         lpf = 1.0
 
@@ -844,6 +853,15 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 cyl_knk[c, 0] = T      # trapped temperature
                 cyl_knk[c, 1] = Pc     # trapped pressure
                 cyl_knk[c, 4] = V      # trapped volume (for motored pressure)
+                # trapped-charge composition for the pipe chemistry: until (and
+                # unless) combustion happens this cycle, the charge is fuel-free
+                # and carries its fresh-air fraction (a fuel-cut / motored cycle
+                # pumps O2 into the pipe -- what earns the overrun pops).
+                cyl_chem[c, 0] = 0.0
+                fr_ivc = MAP * Vdisp / (R * Tman)
+                if fr_ivc > m:
+                    fr_ivc = m
+                cyl_chem[c, 1] = fr_ivc / m
 
             dQ = 0.0
             # combustion heat release (valves closed window around TDC firing)
@@ -865,6 +883,9 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     fuel_max = air / 23.0
                     fuel = throttle * fuel_max
                     Qcyc = fuel * LHV * ceff
+                    # CI burns lean: no surplus fuel; the leftover O2 fraction
+                    # stays as set at IVC (a diesel exhaust always carries air)
+                    cyl_chem[c, 0] = 0.0
                 else:
                     if ram_on:
                         # meter by the fresh air the runner ACTUALLY inducted this
@@ -898,6 +919,25 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     if comp < 0.0:
                         comp = 0.0
                     Qcyc = stoich_fuel * burn_phi * LHV * ceff * comp
+                    # post-burn charge composition (mass fractions), for the
+                    # pipe chemistry. Injected fuel is stoich*phi; the burned
+                    # fuel-equivalent is stoich*burn_phi*comp, which consumes
+                    # the same fraction of the trapped air. The surplus fuel
+                    # (rich running, misfire) and leftover O2 (lean/partial
+                    # burn) ride out with the exhaust -- afterfire scales how
+                    # much fuel survives the port/cat un-oxidized.
+                    bfrac = burn_phi * comp
+                    fuel_un = stoich_fuel * (phi_cmd - bfrac)
+                    if fuel_un < 0.0:
+                        fuel_un = 0.0
+                    air_left = air * (1.0 - bfrac)
+                    if air_left < 0.0:
+                        air_left = 0.0
+                    cyl_chem[c, 0] = afterfire * fuel_un / m
+                    cyl_chem[c, 1] = air_left / m
+                    # X of the injected fuel deposits on the port walls
+                    # (sum of dxb over the cycle is 1, so this banks X*inj)
+                    cyl_chem[c, 2] += X_FILM * stoich_fuel * phi_cmd * dxb
                 # cycle/flame roughness so cycles aren't mathematically identical
                 rough = 1.0 + noise * np.random.standard_normal()
                 if rough < 0.0:
@@ -1095,6 +1135,9 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     # deposit into the bank's pipe cell
                     src_m[cb, ci] += md
                     src_E[cb, ci] += md * _h_of_T(T, cv0_c, b_c, R)   # stagnation enthalpy in
+                    # unburnt fuel / free O2 ride out with the charge
+                    pipe_chem[cb, 0] += md * cyl_chem[c, 0]
+                    pipe_chem[cb, 1] += md * cyl_chem[c, 1]
                 else:
                     # reversion: pipe gas back into cylinder
                     Tp = Pp / (rho[cb, ci] * Rex)
@@ -1104,25 +1147,39 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                     src_m[cb, ci] -= md
                     src_E[cb, ci] -= md * _h_of_T(Tp, cv0_c, b_c, R)
 
-                # ---- afterfire: unburnt fuel igniting in the hot pipe ----
-                # At most ONCE per exhaust event (this EVO edge) so the crackle is
-                # locked to the firing rate, not the sample rate. Two mechanisms:
-                #  (a) LEAN overrun -- closed throttle pumps air, free O2 in the
-                #      pipe ignites the residual fuel (the decel "pops & bangs").
-                #  (b) RICH running (phi>1) -- an over-fuelled engine dumps unburnt
-                #      fuel out with the charge; in a hot pipe it deflagrates and
-                #      throws flames (Harley/open-radial character). Probability and
-                #      burst size grow with the richness and need a hot pipe.
+                # ---- afterfire: the pipe's REAL fuel + O2 inventory deflagrates --
+                # Checked at most once per exhaust event (the EVO edge: a slug of
+                # hot blowdown gas arriving is the ignition source, so pops stay
+                # locked to the firing rate). It needs all three of: unburnt fuel
+                # in the pipe, free oxygen in the pipe, and gas above autoignition.
+                # That is why a rich WOT pull does NOT crackle (no O2 in a rich
+                # exhaust) and the overrun does (DFCO pumps fresh air through a
+                # pipe still wet with fuel from the rich phase before lift-off).
+                # The energy is the burned fuel's heat release, capped so the
+                # local gas cannot exceed the adiabatic flame temperature; what
+                # cannot burn this event stays for the next -> the crackle train.
                 if evo_edge:
-                    Tp_cell = Pp / (rho[cb, ci] * Rex)
-                    if pop > 0.0 and np.random.random() < pop * 0.5:
-                        src_E[cb, ci] += pop_burst * (0.6 + 0.8 * np.random.random())
-                    rich = phi_cmd - 1.0
-                    if (afterfire > 0.0 and rich > 0.0 and Tp_cell > 650.0
-                            and running and not fuelcut
-                            and np.random.random() < afterfire * rich * 3.0):
-                        src_E[cb, ci] += (pop_burst * rich * 1.5
-                                          * (0.5 + np.random.random()))
+                    mf_p = pipe_chem[cb, 0]
+                    ma_p = pipe_chem[cb, 1]
+                    if mf_p > 1e-12 and ma_p > 1e-12:
+                        Tp_cell = Pp / (rho[cb, ci] * Rex)
+                        if Tp_cell > T_AIT:
+                            burn_p = ma_p / AFR          # O2-limited stoich burn
+                            if mf_p < burn_p:
+                                burn_p = mf_p            # fuel-limited
+                            E_p = burn_p * LHV
+                            vol_d = pa_ex[ci] * dx
+                            E_cap = cvex * rho[cb, ci] * vol_d * (T_AFT - Tp_cell)
+                            if E_cap < 0.0:
+                                E_cap = 0.0
+                            if E_p > E_cap:
+                                E_p = E_cap
+                                burn_p = E_p / LHV
+                            src_E[cb, ci] += E_p
+                            mf_p -= burn_p
+                            ma_p -= burn_p * AFR
+                            pipe_chem[cb, 0] = mf_p if mf_p > 0.0 else 0.0
+                            pipe_chem[cb, 1] = ma_p if ma_p > 0.0 else 0.0
 
             # ---- update cylinder state (energy & mass balance) ----
             # internal energy uses the temperature-dependent cv(T); the new temp is
@@ -1141,6 +1198,19 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 T_new = 4000.0
             cyl_m[c] = m_new
             cyl_T[c] = T_new
+
+            # ---- port wall-film evaporation (X-tau). While the cylinder is
+            # firing, the evaporated fuel simply burns with the charge (no
+            # extra accounting); on fuel-cut cycles (DFCO, limiter, shutoff)
+            # it is pumped through UNBURNT and lands in the pipe's fuel
+            # inventory -- the source that sustains the overrun crackle.
+            if not diesel:
+                filmm = cyl_chem[c, 2]
+                if filmm > 0.0:
+                    ev = filmm * dt * inv_tau_film
+                    cyl_chem[c, 2] = filmm - ev
+                    if (not running) or fuelcut or rpm_now >= redline:
+                        pipe_chem[cyl_bank[c], 0] += afterfire * ev
 
             # gas torque on crank = (P - Pcrankcase) * piston force * arm
             Tgas_torque += (Pc - patm) * Apist * (dVdth / Apist)  # = (Pc-patm)*dVdth
@@ -1180,6 +1250,24 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 # without it the solver is a pure-tone organ pipe ("tubey"). It
                 # scales with velocity^2 so it's silent at idle and roars at WOT.
                 flow_acc += rho[b, N - 1] * ut * abs(ut) * np.random.standard_normal()
+
+        # ---- pipe chemistry transport: the unburnt-fuel / free-O2 inventories
+        # wash out of the tailpipe with the actual exhaust flow, so their
+        # residence time (and the decay of a crackle burst after lift-off) is
+        # set by pipe volume / flow rate -- no time constant to tune.
+        for b in range(nbanks):
+            if pipe_chem[b, 0] > 0.0 or pipe_chem[b, 1] > 0.0:
+                m_pipe = 0.0
+                for k in range(N):
+                    m_pipe += rho[b, k] * pa_ex[k]
+                m_pipe *= dx
+                ut = mom[b, N - 1] / rho[b, N - 1]
+                if ut > 0.0 and m_pipe > 1e-12:
+                    f_out = rho[b, N - 1] * ut * fa_ex[N] * dt / m_pipe
+                    if f_out > 1.0:
+                        f_out = 1.0
+                    pipe_chem[b, 0] *= 1.0 - f_out
+                    pipe_chem[b, 1] *= 1.0 - f_out
 
         # ---- per-cylinder 1D intake runners (mode 2): advance each runner with
         # its valve draw as a head-cell source and the mouth open to the plenum
