@@ -1036,18 +1036,16 @@ class EngineSim:
                 self.fuelcut = False
                 self.idle_i = 0.10          # seed idle-air so it doesn't dip on resume
         if self.fuelcut:
-            # decel dashpot / idle-follower: a real ECU holds the IDLE
-            # MANIFOLD DEPRESSION during DFCO (~20-30 kPa), not a sealed
-            # throttle. With the plate slammed to the bare leak the manifold
-            # pulled down to ~3 kPa and every EVO event hammered a
-            # full-atmosphere backflow into the vacuum -- the 'racey'
-            # overrun. Holding MAP constant against rpm needs supply ~ rpm
-            # (choked feed ~ area, swallow ~ rpm*MAP), and area ~ demand^2,
-            # so the valve follows trim*sqrt(rpm/idle) -- the governor's own
-            # learned trim scaled by the engine's own laws, no new constant.
-            # It tapers back to the idle trim as the revs fall: the classic
-            # dashpot.
-            demand = max(demand, self.idle_i * math.sqrt(max(1.0, rpm / idle_t)))
+            # decel dashpot / idle-follower: through DFCO the ECU keeps the
+            # idle valve at its learned trim (idle AIRFLOW, not idle MAP --
+            # the vacuum genuinely deepens with rpm on a real overrun, which
+            # is also where engine braking comes from). The sealed plate
+            # used to pull 3 kPa; the idle trim gives ~idle_MAP*idle/rpm,
+            # softening the EVO backflow slam while keeping real braking.
+            # (A first cut held MAP constant via trim*sqrt(rpm/idle): too
+            # much air -- it halved engine braking and measured as loud as
+            # firing. ECUs hold the valve, not the depression.)
+            demand = max(demand, self.idle_i)
         if self.state != "running":
             self.fuelcut = False
         P[core.P_FUELCUT] = 1.0 if self.fuelcut else 0.0
