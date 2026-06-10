@@ -932,6 +932,23 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
             if f_pre < -0.5:
                 f_pre += cyc / burn
             dxb = wiebe(f_now, wa, wm) - wiebe(f_pre, wa, wm)
+            if (not diesel) and cyl_knk[c, 3] > 0.5:
+                # this cycle DETONATED: the flame's Wiebe schedule is over.
+                # The end gas banked at the knock event burns at the rate a
+                # detonation wave crosses the chamber -- one bore transit at
+                # the local sound speed, sqrt(g R T)/bore per second -- which
+                # is ~100 us, not the ~ms of normal flame travel. The
+                # resulting near-instant heat release IS the knock: pressure
+                # spike, torque jolt and structural impact all follow from
+                # the same dq path as normal combustion.
+                rem = cyl_knk[c, 5]
+                dxb = 0.0
+                if rem > 1e-9:
+                    frac = np.sqrt(g * R * T) / bore_m * dt
+                    if frac > 1.0:
+                        frac = 1.0
+                    dxb = rem * frac
+                    cyl_knk[c, 5] = rem - dxb
             rpm_now = omega * 9.5492966   # 60/(2pi)
             if dxb > 0.0 and rpm_now < redline and running and not fuelcut:
                 # fuel energy available this cycle (mass trapped is ~constant now)
@@ -1039,6 +1056,7 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 if ivc_edge:                        # intake valve just closed
                     cyl_knk[c, 2] = 0.0             # reset the knock integral
                     cyl_knk[c, 3] = 0.0             # reset knocked-this-cycle flag
+                    cyl_knk[c, 5] = 0.0             # clear undetonated remainder
                 if running and not fuelcut and cyl_knk[c, 3] < 0.5:
                     Tivc = cyl_knk[c, 0]; Pivc = cyl_knk[c, 1]
                     if Pivc > 1.0 and Pc > Pivc:
@@ -1055,6 +1073,9 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                                     knock_acc += ki
                                     knock_exc += ki
                                     cyl_knk[c, 3] = 1.0           # one event / cycle
+                                    # the end gas now detonates: bank it for
+                                    # the acoustic-rate release (dxb above)
+                                    cyl_knk[c, 5] = unburned
 
             # ---- Woschni in-cylinder heat transfer ----
             # h_c (W/m^2K) rises with charge pressure, gas velocity (piston speed +
@@ -1079,6 +1100,13 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
                 w_wos = 0.1
             h_wos = (wos_scale * 3.26 * bore_pow * (Pc * 1.0e-3) ** 0.8
                      * T ** (-0.55) * w_wos ** 0.8)
+            if (not diesel) and cyl_knk[c, 3] > 0.5:
+                # knocking cycle: the detonation's pressure oscillation strips
+                # the thermal boundary layer; measured knocking heat flux runs
+                # 2-5x the Woschni prediction. This is what overheats a
+                # knocking engine (and, via hotter walls -> hotter charge,
+                # what makes sustained knock self-reinforcing).
+                h_wos *= 3.0
             x_pist = (V - Vclear) / Apist            # piston travel from TDC
             A_wall = 2.0 * Apist + np.pi * bore_m * x_pist
             q_w = h_wos * A_wall * (T - wallT) * dt
