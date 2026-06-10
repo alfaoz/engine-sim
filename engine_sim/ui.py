@@ -56,6 +56,11 @@ class EngineUI:
         self.live_hp = np.full(self.LIVE_NB, np.nan)
         self._tq_s = 0.0      # time-smoothed torque (cycle-average) for live plot
         self._hp_s = 0.0
+        # ---- sound lab: spectrum + scrolling spectrogram state ----
+        self.SG_F = 96        # spectrogram frequency rows (0..8 kHz)
+        self.SG_T = 160       # spectrogram time columns
+        self.sgram = np.full((self.SG_F, self.SG_T), -90.0)
+        self._spec_win = np.hanning(4096)
 
     # ------------------------------------------------------------ config glue
     def current_edited_config(self) -> EngineConfig:
@@ -310,7 +315,7 @@ class EngineUI:
         self.sim.P[core.P_REDLINE] = dpg.get_value("redline")
         self.sim.P[core.P_OUTGAIN] = (1.0 / dpg.get_value("outscale")
                                       * getattr(self.sim, "bank_trim", 1.0))
-        self.sim.P[core.P_DAMP] = dpg.get_value("damp")
+        self.sim.P[core.P_DAMP] = dpg.get_value("damp")  # wall-loss scale
         self._mark_custom()
 
     def on_audio_toggle(self, s, v):
@@ -435,6 +440,58 @@ class EngineUI:
                       f"peak {pkT:.0f} Nm @ {pkTrpm:.0f},  "
                       f"{pkP:.0f} hp @ {pkPrpm:.0f}")
 
+    # ------------------------------------------------------------- tachometer
+    def _draw_tach(self):
+        """Big drawn rev counter: 270-degree arc with a red zone from the
+        redline, needle, numeric rpm, gear and speed. The thing you actually
+        watch while driving, sized like it matters."""
+        sim = self.sim
+        d = "tach_draw"
+        dpg.delete_item(d, children_only=True)
+        W, H = 248.0, 158.0
+        cx, cy, R = W * 0.5, H * 0.56, 60.0
+        a0, a1 = math.pi * 0.75, math.pi * 2.25
+        red = max(1000.0, sim.cfg.redline_rpm)
+        top = (math.ceil(red / 1000.0) + 1) * 1000.0
+        frac_red = red / top
+        seg = 48
+        pts = []
+        for i in range(seg + 1):
+            a = a0 + (a1 - a0) * i / seg
+            pts.append((cx + R * math.cos(a), cy + R * math.sin(a)))
+        for i in range(seg):
+            tmid = (i + 0.5) / seg
+            col = (205, 70, 60, 255) if tmid >= frac_red else (85, 95, 108, 255)
+            dpg.draw_line(pts[i], pts[i + 1], color=col, thickness=5, parent=d)
+        nt = int(top / 1000.0)
+        for i in range(nt + 1):
+            t = i * 1000.0 / top
+            a = a0 + (a1 - a0) * t
+            ca, sa = math.cos(a), math.sin(a)
+            col = (235, 130, 115, 255) if i * 1000.0 >= red else (150, 160, 170, 255)
+            dpg.draw_line((cx + (R - 7) * ca, cy + (R - 7) * sa),
+                          (cx + (R + 1) * ca, cy + (R + 1) * sa),
+                          color=col, thickness=2, parent=d)
+            if i % 2 == 0:
+                dpg.draw_text((cx + (R - 19) * ca - 5, cy + (R - 19) * sa - 7),
+                              str(i), size=12, color=(150, 160, 170, 255), parent=d)
+        t = min(1.0, max(0.0, sim.rpm / top))
+        a = a0 + (a1 - a0) * t
+        dpg.draw_line((cx, cy),
+                      (cx + (R - 11) * math.cos(a), cy + (R - 11) * math.sin(a)),
+                      color=(255, 140, 90, 255), thickness=3, parent=d)
+        dpg.draw_circle((cx, cy), 4, fill=(255, 140, 90, 255), parent=d)
+        dpg.draw_text((cx - 44, H - 34), f"{sim.rpm:5.0f}", size=28,
+                      color=(235, 235, 235, 255), parent=d)
+        dpg.draw_text((cx + 36, H - 24), "rpm", size=12,
+                      color=(130, 140, 150, 255), parent=d)
+        dpg.draw_text((8, 6), sim.gear_label(), size=30,
+                      color=(255, 225, 120, 255), parent=d)
+        dpg.draw_text((W - 78, 8), f"{sim.speed_kmh():4.0f}", size=22,
+                      color=(160, 220, 255, 255), parent=d)
+        dpg.draw_text((W - 32, 14), "km/h", size=11,
+                      color=(120, 140, 160, 255), parent=d)
+
     # ----------------------------------------------------------- firing diagram
     def _draw_firing(self):
         sim = self.sim
@@ -502,6 +559,17 @@ class EngineUI:
                                     category=dpg.mvThemeCat_Plots)
         dpg.bind_theme(theme)
 
+    # ---------- responsive sizing: plots track the viewport so fullscreen
+    # fills the space instead of leaving a dead band ----------
+    def _relayout(self, *_):
+        vh = dpg.get_viewport_client_height()
+        ph = max(170, (vh - 250) // 2)       # 2 plot rows per tab
+        for tag in ("plot_pipe", "plot_cyl", "plot_wav", "plot_intk",
+                    "plot_live", "plot_turbo", "plot_map", "plot_dyno",
+                    "plot_spec", "plot_sgram"):
+            if dpg.does_item_exist(tag):
+                dpg.configure_item(tag, height=ph)
+
     def build(self):
         dpg.create_context()
         self._apply_theme()
@@ -509,11 +577,12 @@ class EngineUI:
                             width=1860, height=920)
 
         with dpg.window(tag="main"):
-            # ---- top control bar ----
+            # ---- top status bar (pickers + audio only; everything else lives
+            # in the workspace it belongs to) ----
             with dpg.group(horizontal=True):
                 dpg.add_text("Engine:")
                 dpg.add_combo(self.preset_names, default_value=self.preset_names[0],
-                              width=220, callback=self.on_preset, tag="preset")
+                              width=230, callback=self.on_preset, tag="preset")
                 dpg.add_text("Vehicle:")
                 dpg.add_combo(self.vehicle_names, default_value=self.vehicle_names[0],
                               width=190, callback=self.on_vehicle, tag="vehicle")
@@ -521,51 +590,33 @@ class EngineUI:
                                  tag="audio_btn_state")
                 dpg.add_text("Out:")
                 dpg.add_combo(self.out_device_names, default_value="System default",
-                              width=210, callback=self.on_device, tag="outdev")
+                              width=200, callback=self.on_device, tag="outdev")
                 dpg.add_text("Vol")
                 dpg.add_slider_float(tag="vol", default_value=0.6, min_value=0.0,
                                      max_value=1.5, width=110, callback=self.on_volume)
                 dpg.add_button(label="Blip", callback=self.blip)
-                dpg.add_checkbox(label="Lock graphs", default_value=True,
-                                 callback=self.on_lock_graphs, tag="lock_graphs")
-                dpg.add_checkbox(label="Tyre slip", default_value=True,
-                                 callback=self.on_tyre_slip, tag="tyre_slip")
-                dpg.add_text("  Mix:")
-                dpg.add_checkbox(label="Induction", default_value=True,
-                                 callback=self.on_mix_induction, tag="mix_ind")
-                dpg.add_checkbox(label="Body", default_value=True,
-                                 callback=self.on_mix_body, tag="mix_body")
-                dpg.add_checkbox(label="Sat", default_value=True,
-                                 callback=self.on_mix_sat, tag="mix_sat")
-                dpg.add_checkbox(label="Clatter", default_value=False,
-                                 callback=self.on_mix_clatter, tag="mix_clatter")
-                dpg.add_checkbox(label="Knock", default_value=False,
-                                 callback=self.on_mix_knock, tag="mix_knock")
-                dpg.add_checkbox(label="Muffler", default_value=True,
-                                 callback=self.on_mix_muffler, tag="mix_muffler")
 
             dpg.add_separator()
 
             with dpg.group(horizontal=True):
-                # ---- left: drive controls / readouts ----
-                with dpg.child_window(width=250, height=800):
+                # ---- left: drive rail (the things you look at while driving) ----
+                with dpg.child_window(width=272, height=-1, tag="left_rail"):
                     with dpg.group(horizontal=True):
                         dpg.add_button(label="START (Enter)", width=110,
                                        callback=self.on_start)
                         dpg.add_button(label="STOP", width=90, callback=self.on_stop)
-                    dpg.add_text("state: off", tag="state_val", color=(255, 220, 120))
-                    dpg.add_text("", tag="info_disp", color=(150, 150, 150))
-                    dpg.add_separator()
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("state: off", tag="state_val",
+                                     color=(255, 220, 120))
+                        dpg.add_text("", tag="info_disp", color=(150, 150, 150))
+                    # ---- tachometer: the primary live instrument ----
+                    with dpg.drawlist(width=248, height=158, tag="tach_draw"):
+                        pass
                     with dpg.group(horizontal=True):
                         dpg.add_button(label="< Down (Q)", width=100,
                                        callback=self.on_shift_down)
                         dpg.add_button(label="Up (E) >", width=100,
                                        callback=self.on_shift_up)
-                    with dpg.group(horizontal=True):
-                        dpg.add_text("Gear")
-                        dpg.add_text("N", tag="gear_val", color=(255, 230, 120))
-                        dpg.add_text("   Speed")
-                        dpg.add_text("0 km/h", tag="speed_val", color=(160, 220, 255))
                     dpg.add_separator()
                     with dpg.group(horizontal=True):
                         dpg.add_text("Drivetrain", color=(200, 220, 200))
@@ -653,183 +704,334 @@ class EngineUI:
                         dpg.add_text("Fire!", color=(255, 215, 90))
                     dpg.add_text("", tag="fire_lbl", color=(170, 170, 170))
 
-                # ---- middle: plots (2-column grid of compact graphs) ----
-                with dpg.child_window(width=860, height=800):
-                    pw = 410          # per-plot width in the 2-up rows
-                    ph = 176          # compact plot height
+                # ---- center: tabbed workspace, fills the rest of the screen ----
+                with dpg.child_window(width=-1, height=-1, tag="center_panel"):
+                    with dpg.tab_bar(tag="tabs"):
 
-                    with dpg.group(horizontal=True):
-                        with dpg.plot(label="Exhaust pipe pressure (wave -> sound)",
-                                      height=ph, width=pw, no_inputs=True,
-                                      tag="plot_pipe"):
-                            dpg.add_plot_axis(dpg.mvXAxis, label="position (m)")
-                            with dpg.plot_axis(dpg.mvYAxis, label="kPa gauge",
-                                               tag="pipe_y"):
-                                dpg.add_line_series([0], [0], tag="pipe_series")
-                        with dpg.plot(label="Cylinder #1 pressure vs crank",
-                                      height=ph, width=pw, no_inputs=True,
-                                      tag="plot_cyl"):
-                            dpg.add_plot_axis(dpg.mvXAxis, label="cycle angle (deg)")
-                            with dpg.plot_axis(dpg.mvYAxis, label="bar",
-                                               tag="cyl_y"):
-                                dpg.add_line_series([0], [0], tag="cyl_series")
-
-                    with dpg.group(horizontal=True):
-                        with dpg.plot(label="Tailpipe audio waveform",
-                                      height=ph, width=pw, no_inputs=True,
-                                      tag="plot_wav"):
-                            dpg.add_plot_axis(dpg.mvXAxis, label="sample")
-                            with dpg.plot_axis(dpg.mvYAxis, label="amp",
-                                               tag="wav_y"):
-                                dpg.add_line_series([0], [0], tag="wav_series")
-                        with dpg.plot(label="Intake duct pressure (induction wave)",
-                                      height=ph, width=pw, no_inputs=True,
-                                      tag="plot_intk"):
-                            dpg.add_plot_axis(dpg.mvXAxis, label="position (m)")
-                            with dpg.plot_axis(dpg.mvYAxis, label="kPa gauge",
-                                               tag="intk_y"):
-                                dpg.add_line_series([0], [0], tag="intk_series")
-
-                    with dpg.group(horizontal=True):
-                        with dpg.plot(label="Live torque & power vs RPM",
-                                      height=ph, width=pw, no_inputs=True,
-                                      tag="plot_live"):
-                            dpg.add_plot_legend()
-                            dpg.add_plot_axis(dpg.mvXAxis, label="RPM", tag="live_x")
-                            with dpg.plot_axis(dpg.mvYAxis, label="Nm / hp",
-                                               tag="live_y"):
-                                dpg.add_line_series([0], [0], tag="live_tq_s",
-                                                    label="torque")
-                                dpg.add_line_series([0], [0], tag="live_hp_s",
-                                                    label="power")
-                        with dpg.plot(label="Boost & turbo speed vs time",
-                                      height=ph, width=pw, no_inputs=True,
-                                      tag="plot_turbo"):
-                            dpg.add_plot_legend()
-                            dpg.add_plot_axis(dpg.mvXAxis, label="frame", tag="turbo_x")
-                            with dpg.plot_axis(dpg.mvYAxis, label="kPa / krpm",
-                                               tag="turbo_y"):
-                                dpg.add_line_series([0], [0], tag="boost_s",
-                                                    label="boost kPa")
-                                dpg.add_line_series([0], [0], tag="turbo_s",
-                                                    label="turbo krpm")
-
-                    with dpg.group(horizontal=True):
-                        with dpg.plot(label="Manifold pressure (MAP) vs time",
-                                      height=ph, width=pw, no_inputs=True,
-                                      tag="plot_map"):
-                            dpg.add_plot_axis(dpg.mvXAxis, label="frame", tag="map_x")
-                            with dpg.plot_axis(dpg.mvYAxis, label="kPa", tag="map_y"):
-                                dpg.add_line_series([0], [0], tag="map_s")
-                        with dpg.group():
+                        # ================= DRIVE =================
+                        with dpg.tab(label=" Drive ", tag="tab_drive"):
                             with dpg.group(horizontal=True):
-                                dpg.add_button(label="RUN DYNO", width=100,
+                                dpg.add_checkbox(label="Lock graphs",
+                                                 default_value=True,
+                                                 callback=self.on_lock_graphs,
+                                                 tag="lock_graphs")
+                                dpg.add_checkbox(label="Tyre slip",
+                                                 default_value=True,
+                                                 callback=self.on_tyre_slip,
+                                                 tag="tyre_slip")
+                            with dpg.table(header_row=False,
+                                           policy=dpg.mvTable_SizingStretchSame):
+                                dpg.add_table_column()
+                                dpg.add_table_column()
+                                with dpg.table_row():
+                                    with dpg.plot(label="Cylinder #1 pressure vs crank",
+                                                  height=176, width=-1,
+                                                  no_inputs=True, tag="plot_cyl"):
+                                        dpg.add_plot_axis(dpg.mvXAxis,
+                                                          label="cycle angle (deg)")
+                                        with dpg.plot_axis(dpg.mvYAxis, label="bar",
+                                                           tag="cyl_y"):
+                                            dpg.add_line_series([0], [0],
+                                                                tag="cyl_series")
+                                    with dpg.plot(label="Exhaust pipe pressure (wave -> sound)",
+                                                  height=176, width=-1,
+                                                  no_inputs=True, tag="plot_pipe"):
+                                        dpg.add_plot_axis(dpg.mvXAxis,
+                                                          label="position (m)")
+                                        with dpg.plot_axis(dpg.mvYAxis,
+                                                           label="kPa gauge",
+                                                           tag="pipe_y"):
+                                            dpg.add_line_series([0], [0],
+                                                                tag="pipe_series")
+                                with dpg.table_row():
+                                    with dpg.plot(label="Manifold pressure (MAP) vs time",
+                                                  height=176, width=-1,
+                                                  no_inputs=True, tag="plot_map"):
+                                        dpg.add_plot_axis(dpg.mvXAxis, label="frame",
+                                                          tag="map_x")
+                                        with dpg.plot_axis(dpg.mvYAxis, label="kPa",
+                                                           tag="map_y"):
+                                            dpg.add_line_series([0], [0], tag="map_s")
+                                    with dpg.plot(label="Boost & turbo speed vs time",
+                                                  height=176, width=-1,
+                                                  no_inputs=True, tag="plot_turbo"):
+                                        dpg.add_plot_legend()
+                                        dpg.add_plot_axis(dpg.mvXAxis, label="frame",
+                                                          tag="turbo_x")
+                                        with dpg.plot_axis(dpg.mvYAxis,
+                                                           label="kPa / krpm",
+                                                           tag="turbo_y"):
+                                            dpg.add_line_series([0], [0], tag="boost_s",
+                                                                label="boost kPa")
+                                            dpg.add_line_series([0], [0], tag="turbo_s",
+                                                                label="turbo krpm")
+
+                        # ================= SOUND LAB =================
+                        with dpg.tab(label=" Sound lab ", tag="tab_sound"):
+                            # the A/B toggles live NEXT TO the instruments that
+                            # show what they do
+                            with dpg.group(horizontal=True):
+                                dpg.add_text("Mix:", color=(170, 170, 170))
+                                dpg.add_checkbox(label="Induction", default_value=True,
+                                                 callback=self.on_mix_induction,
+                                                 tag="mix_ind")
+                                dpg.add_checkbox(label="Body", default_value=True,
+                                                 callback=self.on_mix_body,
+                                                 tag="mix_body")
+                                dpg.add_checkbox(label="Sat", default_value=True,
+                                                 callback=self.on_mix_sat,
+                                                 tag="mix_sat")
+                                dpg.add_checkbox(label="Clatter", default_value=True,
+                                                 callback=self.on_mix_clatter,
+                                                 tag="mix_clatter")
+                                dpg.add_checkbox(label="Knock", default_value=False,
+                                                 callback=self.on_mix_knock,
+                                                 tag="mix_knock")
+                                dpg.add_checkbox(label="Muffler", default_value=True,
+                                                 callback=self.on_mix_muffler,
+                                                 tag="mix_muffler")
+                                dpg.add_text("   Tuning:", color=(170, 170, 170))
+                                self._num("outscale", "out Pa/unit", 300, 30, 3000,
+                                          live=True)
+                                self._num("damp", "wall loss", 1.0, 0.0, 4.0,
+                                          live=True)
+                                dpg.add_slider_float(tag="backfire",
+                                                     label="crackle",
+                                                     default_value=0.3, min_value=0.0,
+                                                     max_value=3.0, width=110,
+                                                     callback=self.on_backfire)
+                            with dpg.table(header_row=False,
+                                           policy=dpg.mvTable_SizingStretchSame):
+                                dpg.add_table_column()
+                                dpg.add_table_column()
+                                with dpg.table_row():
+                                    with dpg.plot(label="Spectrum",
+                                                  height=176, width=-1,
+                                                  no_inputs=True, tag="plot_spec"):
+                                        dpg.add_plot_axis(dpg.mvXAxis, label="Hz",
+                                                          tag="spec_x")
+                                        with dpg.plot_axis(dpg.mvYAxis, label="dB",
+                                                           tag="spec_y"):
+                                            dpg.add_line_series([0], [0],
+                                                                tag="spec_series")
+                                    with dpg.plot(label="Spectrogram (0-8 kHz)",
+                                                  height=176, width=-1,
+                                                  no_inputs=True, tag="plot_sgram"):
+                                        dpg.add_plot_axis(dpg.mvXAxis, label="time",
+                                                          no_tick_labels=True,
+                                                          tag="sg_x")
+                                        with dpg.plot_axis(dpg.mvYAxis, label="kHz",
+                                                           tag="sg_y"):
+                                            dpg.add_heat_series(
+                                                [0.0] * (self.SG_F * self.SG_T),
+                                                rows=self.SG_F, cols=self.SG_T,
+                                                scale_min=-90.0, scale_max=-20.0,
+                                                bounds_min=(0.0, 0.0),
+                                                bounds_max=(float(self.SG_T), 8.0),
+                                                format="", tag="sg_series")
+                                with dpg.table_row():
+                                    with dpg.plot(label="Tailpipe audio waveform",
+                                                  height=176, width=-1,
+                                                  no_inputs=True, tag="plot_wav"):
+                                        dpg.add_plot_axis(dpg.mvXAxis, label="sample")
+                                        with dpg.plot_axis(dpg.mvYAxis, label="amp",
+                                                           tag="wav_y"):
+                                            dpg.add_line_series([0], [0],
+                                                                tag="wav_series")
+                                    with dpg.plot(label="Intake duct pressure (induction wave)",
+                                                  height=176, width=-1,
+                                                  no_inputs=True, tag="plot_intk"):
+                                        dpg.add_plot_axis(dpg.mvXAxis,
+                                                          label="position (m)")
+                                        with dpg.plot_axis(dpg.mvYAxis,
+                                                           label="kPa gauge",
+                                                           tag="intk_y"):
+                                            dpg.add_line_series([0], [0],
+                                                                tag="intk_series")
+
+                        # ================= DYNO =================
+                        with dpg.tab(label=" Dyno ", tag="tab_dyno"):
+                            with dpg.group(horizontal=True):
+                                dpg.add_button(label="RUN DYNO", width=110,
                                                callback=self.on_dyno, tag="dyno_btn")
-                                dpg.add_button(label="clear live", width=80,
+                                dpg.add_button(label="clear live", width=90,
                                                callback=self.on_clear_live)
-                            dpg.add_text("WOT sweep", tag="dyno_status",
-                                         color=(170, 170, 170))
-                            with dpg.plot(label="Dyno - torque & power vs RPM",
-                                          height=ph - 36, width=pw, no_inputs=True,
-                                          tag="plot_dyno"):
-                                dpg.add_plot_legend()
-                                dpg.add_plot_axis(dpg.mvXAxis, label="RPM",
-                                                  tag="dyno_x")
-                                with dpg.plot_axis(dpg.mvYAxis, label="Nm / hp",
-                                                   tag="dyno_y"):
-                                    dpg.add_line_series([0], [0], tag="dyno_tq",
-                                                        label="torque")
-                                    dpg.add_line_series([0], [0], tag="dyno_hp",
-                                                        label="power")
+                                dpg.add_text("WOT sweep", tag="dyno_status",
+                                             color=(170, 170, 170))
+                            with dpg.table(header_row=False,
+                                           policy=dpg.mvTable_SizingStretchSame):
+                                dpg.add_table_column()
+                                dpg.add_table_column()
+                                with dpg.table_row():
+                                    with dpg.plot(label="Dyno - torque & power vs RPM",
+                                                  height=380, width=-1,
+                                                  no_inputs=True, tag="plot_dyno"):
+                                        dpg.add_plot_legend()
+                                        dpg.add_plot_axis(dpg.mvXAxis, label="RPM",
+                                                          tag="dyno_x")
+                                        with dpg.plot_axis(dpg.mvYAxis,
+                                                           label="Nm / hp",
+                                                           tag="dyno_y"):
+                                            dpg.add_line_series([0], [0], tag="dyno_tq",
+                                                                label="torque")
+                                            dpg.add_line_series([0], [0], tag="dyno_hp",
+                                                                label="power")
+                                    with dpg.plot(label="Live torque & power vs RPM",
+                                                  height=380, width=-1,
+                                                  no_inputs=True, tag="plot_live"):
+                                        dpg.add_plot_legend()
+                                        dpg.add_plot_axis(dpg.mvXAxis, label="RPM",
+                                                          tag="live_x")
+                                        with dpg.plot_axis(dpg.mvYAxis,
+                                                           label="Nm / hp",
+                                                           tag="live_y"):
+                                            dpg.add_line_series([0], [0],
+                                                                tag="live_tq_s",
+                                                                label="torque")
+                                            dpg.add_line_series([0], [0],
+                                                                tag="live_hp_s",
+                                                                label="power")
 
-                # ---- right: engine design parameters ----
-                with dpg.child_window(width=320, height=800):
-                    dpg.add_text("GEOMETRY", color=(180, 180, 255))
-                    self._num("bore", "Bore (mm)", 80, 20, 140)
-                    self._num("stroke", "Stroke (mm)", 80, 20, 140)
-                    self._num("conrod", "Conrod (mm)", 140, 50, 250)
-                    self._num("cr", "Compression ratio", 10, 5, 24)
-                    dpg.add_input_int(label="Cylinders", tag="ncyl", default_value=4,
-                                      min_value=1, max_value=16, width=120,
-                                      callback=self.on_geometry_edit)
-                    dpg.add_radio_button(("4-stroke", "2-stroke"), tag="cycle",
-                                         default_value="4-stroke", horizontal=True,
-                                         callback=self.on_geometry_edit)
-                    dpg.add_checkbox(label="Diesel (compression ignition)",
-                                     tag="diesel", callback=self.on_geometry_edit)
-                    self._num("boost", "Turbo boost (kPa)", 0, 0, 250)
-                    dpg.add_separator()
-                    dpg.add_text("COMBUSTION / VALVES", color=(255, 200, 150))
-                    self._num("ign", "Ignition BTDC (deg)", 22, 0, 60, live=True)
-                    self._num("burn", "Burn duration (deg)", 55, 20, 120, live=True)
-                    self._num("evo", "EVO (deg)", 145, 90, 220)
-                    self._num("evc", "EVC (deg)", 375, 320, 420)
-                    self._num("ivo", "IVO (deg)", 355, 300, 420)
-                    self._num("ivc", "IVC (deg)", 585, 500, 640)
-                    dpg.add_input_float(tag="octane", label="Fuel octane (RON)",
-                                        default_value=95.0, min_value=80.0,
-                                        max_value=110.0, width=120, step=0,
-                                        callback=self.on_octane, on_enter=False)
-                    dpg.add_separator()
-                    dpg.add_text("EXHAUST", color=(150, 255, 220))
-                    self._num("pipelen", "Pipe length (m)", 1.5, 0.3, 3.0)
-                    self._num("pipedia", "Pipe dia (mm)", 50, 18, 90)
-                    self._num("spread", "Runner spread", 0.2, 0.0, 0.4)
-                    self._num("muffvol", "Muffler vol (L, <0 straight)", 0, -1, 60)
-                    dpg.add_separator()
-                    dpg.add_text("DYNAMICS", color=(220, 220, 220))
-                    self._num("redline", "Redline (rpm)", 7000, 3000, 12000, live=True)
-                    self._num("idle", "Idle (rpm)", 850, 400, 2000)
-                    self._num("inertia", "Flywheel inertia", 0.18, 0.01, 1.2)
-                    dpg.add_separator()
-                    dpg.add_text("AUDIO/SIM TUNING", color=(200, 200, 200))
-                    self._num("outscale", "Output scale (Pa/unit)", 2600, 300, 20000,
-                              live=True)
-                    self._num("damp", "Exhaust damping", 0.0015, 0.0, 0.02, live=True)
-                    dpg.add_slider_float(tag="backfire", label="Backfire (overrun)",
-                                         default_value=0.0, min_value=0.0,
-                                         max_value=3.0, width=120,
-                                         callback=self.on_backfire)
-                    dpg.add_separator()
-                    dpg.add_button(label="REBUILD ENGINE", width=-1,
-                                   callback=self.on_rebuild,
-                                   tag="rebuild_btn")
+                        # ================= BUILDER =================
+                        with dpg.tab(label=" Builder ", tag="tab_builder"):
+                            with dpg.child_window(width=-1, height=-1):
+                                with dpg.table(header_row=False,
+                                               policy=dpg.mvTable_SizingStretchSame):
+                                    dpg.add_table_column()
+                                    dpg.add_table_column()
+                                    dpg.add_table_column()
+                                    with dpg.table_row():
+                                        with dpg.group():
+                                            dpg.add_text("GEOMETRY",
+                                                         color=(180, 180, 255))
+                                            self._num("bore", "Bore (mm)", 80, 20, 140)
+                                            self._num("stroke", "Stroke (mm)",
+                                                      80, 20, 140)
+                                            self._num("conrod", "Conrod (mm)",
+                                                      140, 50, 250)
+                                            self._num("cr", "Compression ratio",
+                                                      10, 5, 24)
+                                            dpg.add_input_int(
+                                                label="Cylinders", tag="ncyl",
+                                                default_value=4, min_value=1,
+                                                max_value=16, width=120,
+                                                callback=self.on_geometry_edit)
+                                            dpg.add_radio_button(
+                                                ("4-stroke", "2-stroke"), tag="cycle",
+                                                default_value="4-stroke",
+                                                horizontal=True,
+                                                callback=self.on_geometry_edit)
+                                            dpg.add_checkbox(
+                                                label="Diesel (compression ignition)",
+                                                tag="diesel",
+                                                callback=self.on_geometry_edit)
+                                            self._num("boost", "Turbo boost (kPa)",
+                                                      0, 0, 250)
+                                            dpg.add_separator()
+                                            dpg.add_text("DYNAMICS",
+                                                         color=(220, 220, 220))
+                                            self._num("redline", "Redline (rpm)",
+                                                      7000, 3000, 12000, live=True)
+                                            self._num("idle", "Idle (rpm)",
+                                                      850, 400, 2000)
+                                            self._num("inertia", "Flywheel inertia",
+                                                      0.18, 0.01, 1.2)
+                                            dpg.add_separator()
+                                            dpg.add_button(label="REBUILD ENGINE",
+                                                           width=-1,
+                                                           callback=self.on_rebuild,
+                                                           tag="rebuild_btn")
+                                        with dpg.group():
+                                            dpg.add_text("COMBUSTION / VALVES",
+                                                         color=(255, 200, 150))
+                                            self._num("ign", "Ignition BTDC (deg)",
+                                                      22, 0, 60, live=True)
+                                            self._num("burn", "Burn duration (deg)",
+                                                      55, 20, 120, live=True)
+                                            self._num("evo", "EVO (deg)", 145, 90, 220)
+                                            self._num("evc", "EVC (deg)",
+                                                      375, 320, 420)
+                                            self._num("ivo", "IVO (deg)",
+                                                      355, 300, 420)
+                                            self._num("ivc", "IVC (deg)",
+                                                      585, 500, 640)
+                                            dpg.add_input_float(
+                                                tag="octane", label="Fuel octane (RON)",
+                                                default_value=95.0, min_value=80.0,
+                                                max_value=110.0, width=120, step=0,
+                                                callback=self.on_octane,
+                                                on_enter=False)
+                                            dpg.add_separator()
+                                            dpg.add_text("EXHAUST",
+                                                         color=(150, 255, 220))
+                                            self._num("pipelen", "Pipe length (m)",
+                                                      1.5, 0.3, 3.0)
+                                            self._num("pipedia", "Pipe dia (mm)",
+                                                      50, 18, 90)
+                                            self._num("spread", "Runner spread",
+                                                      0.2, 0.0, 0.4)
+                                            self._num("muffvol",
+                                                      "Muffler vol (L, <0 straight)",
+                                                      0, -1, 60)
+                                            dpg.add_separator()
+                                            dpg.add_text("TIMING / CYLINDERS",
+                                                         color=(255, 200, 150))
+                                            dpg.add_text(
+                                                "After changing cylinder count:",
+                                                color=(140, 140, 140), wrap=280)
+                                            dpg.add_button(
+                                                label="AUTO-ADJUST TIMING", width=-1,
+                                                callback=self.on_auto_timing)
+                                            dpg.add_text("firing order: --",
+                                                         tag="firing_lbl",
+                                                         color=(170, 170, 170),
+                                                         wrap=280)
+                                        with dpg.group():
+                                            dpg.add_text("CUSTOM ENGINE",
+                                                         color=(255, 220, 150))
+                                            dpg.add_text("stock", tag="custom_lbl",
+                                                         color=(150, 200, 150),
+                                                         wrap=280)
+                                            dpg.add_text(
+                                                "Edit any value -> becomes custom. "
+                                                "Name + Save:",
+                                                color=(140, 140, 140), wrap=280)
+                                            dpg.add_input_text(tag="custom_name",
+                                                               hint="my engine name",
+                                                               width=-1)
+                                            dpg.add_button(
+                                                label="SAVE ENGINE", width=-1,
+                                                callback=self.on_save_engine)
+                                            dpg.add_separator()
+                                            dpg.add_text("ADVANCED",
+                                                         color=(180, 180, 255))
+                                            self._num("intlen", "Intake length (m)",
+                                                      0.45, 0.1, 1.0)
+                                            self._num("intdia", "Intake dia (mm)",
+                                                      55, 20, 110)
+                                            self._num("ptune", "Power tune (x)",
+                                                      1.0, 0.5, 1.6)
+                                            dpg.add_input_int(
+                                                tag="ebanks",
+                                                label="Exhaust banks (0=auto)",
+                                                default_value=0, min_value=0,
+                                                max_value=4, width=120,
+                                                callback=self.on_geometry_edit)
+                                            dpg.add_text(
+                                                "V/flat=2, W=4 -> bank rumble",
+                                                color=(140, 140, 140), wrap=280)
+                                            dpg.add_separator()
+                                            dpg.add_text("VEHICLE",
+                                                         color=(200, 220, 200))
+                                            dpg.add_text("--", tag="veh_info",
+                                                         color=(180, 180, 180),
+                                                         wrap=280)
 
-                # ---- far right: custom engine / timing / advanced ----
-                with dpg.child_window(width=290, height=800):
-                    dpg.add_text("CUSTOM ENGINE", color=(255, 220, 150))
-                    dpg.add_text("stock", tag="custom_lbl", color=(150, 200, 150),
-                                 wrap=270)
-                    dpg.add_text("Edit any value -> becomes custom. Name + Save:",
-                                 color=(140, 140, 140), wrap=270)
-                    dpg.add_input_text(tag="custom_name", hint="my engine name",
-                                       width=-1)
-                    dpg.add_button(label="SAVE ENGINE", width=-1,
-                                   callback=self.on_save_engine)
-                    dpg.add_separator()
-                    dpg.add_text("TIMING / CYLINDERS", color=(255, 200, 150))
-                    dpg.add_text("After changing cylinder count, click:",
-                                 color=(140, 140, 140), wrap=270)
-                    dpg.add_button(label="AUTO-ADJUST TIMING", width=-1,
-                                   callback=self.on_auto_timing)
-                    dpg.add_text("firing order: --", tag="firing_lbl",
-                                 color=(170, 170, 170), wrap=270)
-                    dpg.add_separator()
-                    dpg.add_text("ADVANCED (not on main panel)",
-                                 color=(180, 180, 255))
-                    self._num("intlen", "Intake length (m)", 0.45, 0.1, 1.0)
-                    self._num("intdia", "Intake dia (mm)", 55, 20, 110)
-                    self._num("ptune", "Power tune (x)", 1.0, 0.5, 1.6)
-                    dpg.add_input_int(tag="ebanks", label="Exhaust banks (0=auto)",
-                                      default_value=0, min_value=0, max_value=4,
-                                      width=120, callback=self.on_geometry_edit)
-                    dpg.add_text("V/flat=2, W=4 -> bank rumble", color=(140, 140, 140),
-                                 wrap=270)
-                    dpg.add_separator()
-                    dpg.add_text("VEHICLE", color=(200, 220, 200))
-                    dpg.add_text("--", tag="veh_info", color=(180, 180, 180),
-                                 wrap=270)
-
+        try:
+            dpg.bind_colormap("plot_sgram", dpg.mvPlotColormap_Plasma)
+        except Exception:
+            pass
+        dpg.set_viewport_resize_callback(self._relayout)
         self.push_config_to_widgets(self.sim.cfg)
 
         with dpg.handler_registry():
@@ -840,6 +1042,7 @@ class EngineUI:
         dpg.setup_dearpygui()
         dpg.show_viewport()
         dpg.set_primary_window("main", True)
+        self._relayout()
 
     def _num(self, tag, label, default, mn, mx, live=False):
         cb = self.on_live_timing if live else self.on_geometry_edit
@@ -879,14 +1082,24 @@ class EngineUI:
             sim.set_brake(0.0)
             dpg.set_value("brake", 0.0)
 
-        # advance sim in UI thread only when audio isn't driving it
+        # advance sim in UI thread only when audio isn't driving it; feed the
+        # audio tap ring too, so the sound-lab instruments work without a device
         if not sim.is_audio_on():
-            sim.step_block(1500)
+            out = sim.step_block(1500)
+            x = np.tanh(np.nan_to_num(out) * sim.volume)
+            buf = sim.audio_tap
+            tp = sim._tap_pos
+            n = len(x)
+            if tp + n <= len(buf):
+                buf[tp:tp + n] = x
+            else:
+                k = len(buf) - tp
+                buf[tp:] = x[:k]
+                buf[:n - k] = x[k:]
+            sim._tap_pos = (tp + n) % len(buf)
 
         # drive readouts
         dpg.set_value("state_val", f"state: {sim.state}")
-        dpg.set_value("gear_val", sim.gear_label())
-        dpg.set_value("speed_val", f"{sim.speed_kmh():.0f} km/h")
 
         # ---- readouts / live metrics ----
         cfg = sim.cfg
@@ -955,12 +1168,31 @@ class EngineUI:
         dpg.set_value("cyl_series", [cx.tolist(), (sim.scope_p / 1e5).tolist()])
         dpg.fit_axis_data("cyl_y")
 
-        # audio waveform
-        tap = sim.audio_tap
-        pos = sim._tap_pos
-        wav = np.concatenate([tap[pos:], tap[:pos]])[-1024:]
-        dpg.set_value("wav_series", [list(range(len(wav))), wav.tolist()])
-        dpg.set_axis_limits("wav_y", -1.05, 1.05)
+        # ---- sound lab: waveform + spectrum + scrolling spectrogram ----
+        # (only computed while the Sound lab tab is showing)
+        if dpg.get_value("tabs") in ("tab_sound", "Sound lab"):
+            tap = sim.audio_tap
+            pos = sim._tap_pos
+            wav = np.concatenate([tap[pos:], tap[:pos]])
+            dpg.set_value("wav_series",
+                          [list(range(1024)), wav[-1024:].tolist()])
+            dpg.set_axis_limits("wav_y", -1.05, 1.05)
+            w = wav[-4096:]
+            sp = np.abs(np.fft.rfft(w * self._spec_win)) / 1024.0
+            db = 20.0 * np.log10(sp + 1e-7)
+            fr = np.fft.rfftfreq(4096, 1.0 / SAMPLE_RATE)
+            m = fr <= 8000.0
+            dpg.set_value("spec_series", [fr[m].tolist(), db[m].tolist()])
+            dpg.set_axis_limits("spec_y", -110.0, -5.0)
+            dpg.set_axis_limits("spec_x", 0.0, 8000.0)
+            sel = db[m]
+            F = self.SG_F
+            bs = len(sel) // F
+            col = sel[:bs * F].reshape(F, bs).max(axis=1)
+            self.sgram[:, :-1] = self.sgram[:, 1:]
+            self.sgram[:, -1] = col
+            # heat-series row 0 renders at the top -> flip so 8 kHz is up
+            dpg.set_value("sg_series", [self.sgram[::-1].ravel().tolist()])
 
         # intake duct pressure profile (induction wave; static unless mixed in)
         Ni = sim.Ni
@@ -1022,8 +1254,10 @@ class EngineUI:
                           f"{getattr(veh, 'drivetrain', '?').upper()}, "
                           f"{veh.n_gears()}-spd, wheel {veh.wheel_radius:.2f} m")
 
-        # firing diagram + dyno result hand-off from the worker thread
+        # tachometer + firing diagram + context-sensitive turbo plot
+        self._draw_tach()
         self._draw_firing()
+        dpg.configure_item("plot_turbo", show=bool(sim.P[core.P_TURBO] > 0.5))
         if self._dyno_result is not None:
             self._apply_dyno_result()
 

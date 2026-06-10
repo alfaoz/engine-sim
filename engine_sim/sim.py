@@ -48,9 +48,12 @@ class EngineSim:
         self.rpm = 0.0
         self.rpm_prev = 0.0         # previous rpm (idle governor derivative)
         self.rpm_rate = 0.0         # filtered rpm rate, rpm/s
+        self.rpm_gov = 0.0          # low-passed idle speed the governor regulates
+        self._rpm_gov_prev = 0.0    # for the governor's (filtered) rate term
         self.torque = 0.0
-        self.audio_tap = np.zeros(2048, dtype=np.float64)   # ring of last output
+        self.audio_tap = np.zeros(8192, dtype=np.float64)   # ring of last output
         self._tap_pos = 0
+        self._cb_buf = np.zeros(BLOCK, dtype=np.float64)     # reused audio out buffer
 
         # vehicle / control state
         self.vehicle = get_vehicle("Bench / neutral (free rev)")
@@ -61,6 +64,7 @@ class EngineSim:
         self.idle_i = 0.0          # idle governor integrator
         self.shift_timer = 0.0     # clutch-out window during a shift
         self.crank_timer = 0.0
+        self.crank_assist = 0.0
         self.clutch_cap = 200.0
         self.boost = 0.0           # actual turbo boost (Pa), spools with lag
         self.thr_smooth = 0.0      # slewed throttle (intake/fuel dynamics)
@@ -79,11 +83,16 @@ class EngineSim:
         # airbox + throttled boundary before it earns a place in the mix.
         self.mix_induction = 0.15  # induction mix ON by default (kept modest:
         #                            it runs hot/clips at higher levels)
-        self.mix_body = 0.35
+        # body resonator is now light voicing on top of the REAL expansion-chamber
+        # geometry (which already supplies the chamber response); was 0.35.
+        self.mix_body = 0.18
         self.mix_sat = 1.0
         # new audio sources (toggleable so issues can be A/B'd / soloed).
-        # clatter + knock OFF by default (cleaner tone); muffler on.
-        self.mix_clatter = False   # combustion clatter (diesel knock / petrol edge)
+        # clatter ON by default: it's the engine's raw MECHANICAL noise (the
+        # combustion pressure-rise ringing the block/valvetrain), the presence the
+        # bare exhaust lacks -- without it idle sounds like just a resonant pipe
+        # ("a balloon"). knock (a fault ping) stays off; muffler on.
+        self.mix_clatter = True    # combustion/mechanical clatter (engine body noise)
         self.mix_knock = False     # spark-knock "ping" (petrol)
         self.mix_muffler = True    # muffler HF transmission loss
         self._clatter_on = 0.0
@@ -126,9 +135,11 @@ class EngineSim:
         P[core.P_CV] = R_AIR / (GAMMA_CYL - 1.0)
         P[core.P_LHV] = 43.0e6 if cfg.diesel else 44.0e6
         P[core.P_AFR] = 14.7
-        # indicated->brake losses we don't fully model (blowby, incomplete burn,
-        # heat) — calibrated so BMEP lands in the real range (NA ~10-12 bar)
-        P[core.P_COMBEFF] = 0.78 * cfg.power_tune
+        # indicated->brake losses we don't fully model (blowby, incomplete burn) --
+        # calibrated so BMEP lands in the real range (NA ~10-12 bar). Raised from
+        # 0.78 now that Woschni models the in-cylinder heat loss EXPLICITLY, so this
+        # catch-all no longer has to hide as much heat-transfer approximation.
+        P[core.P_COMBEFF] = 0.84 * cfg.power_tune
         P[core.P_IGN] = math.radians(cyc_deg - cfg.ignition_btdc)
         P[core.P_BURN] = math.radians(cfg.burn_duration)
         P[core.P_WIEBE_A] = 5.0
@@ -155,6 +166,12 @@ class EngineSim:
             rev_scale = (cfg.redline_rpm / 6000.0) ** 0.5
             P[core.P_AIN] = 0.135 * Apist * rev_scale
             P[core.P_AEX] = 0.135 * Apist * rev_scale
+        # closed-throttle idle-air leak (fraction of full throttle area). A high-rev
+        # engine has oversized valves AND throttle, so a fixed fractional leak feeds
+        # too much air to idle low -- scale the leak down by the valve-oversize so
+        # the governor keeps authority to pull idle down to target on every engine.
+        rev_scale_idle = (cfg.redline_rpm / 6000.0) ** 0.5 if cfg.stroke_cycle == 4 else 1.0
+        self.idle_floor = 0.0008 / max(1.0, rev_scale_idle) ** 2
         P[core.P_CD] = 0.70
         P[core.P_INERTIA] = cfg.inertia
         # Friction from FMEP (friction mean effective pressure) x swept volume,
@@ -175,8 +192,11 @@ class EngineSim:
         rev_soft = min(1.0, 7500.0 / cfg.redline_rpm)
         P[core.P_FRICW] = 270.0 * Vd_total / divisor * rev_soft
         P[core.P_LOAD] = self.load
-        # starter motor torque and clutch capacity scale with engine size
-        self.starter_torque = 25.0 + 30.0 * disp_l
+        # starter motor torque: sized to crank past peak compression, so it scales
+        # with displacement AND compression ratio (a high-CR big-bore single/twin
+        # resists cranking far more than its displacement alone implies -- now that
+        # cold air has its real gamma~1.4 the compression pressure is honest).
+        self.starter_torque = 28.0 + 40.0 * disp_l * (0.55 + 0.05 * cfg.compression_ratio)
         # clutch torque capacity ~ 1.5-2x peak engine torque (disp_l is litres)
         self.clutch_cap = 320.0 * disp_l + 50.0
 
@@ -255,13 +275,21 @@ class EngineSim:
         # split a fixed total cell budget across the banks (a 2-bank V8 uses ~half
         # the cells per pipe). Total work then stays ~that of a single pipe, which
         # is what keeps multi-bank engines from underrunning ("periodic cutout").
-        base_cells = min(320, max(90, cfg.pipe_length / 0.008))
-        N = int(np.clip(base_cells / nbanks, 60, 320))
-        dx = cfg.pipe_length / N
+        # cell budget: the 2nd-order MUSCL solver resolves the wave action at a
+        # much coarser grid than the old first-order scheme, so a bigger dx keeps
+        # the fidelity while cutting compute. Cost scales ~N^2 (more cells AND more
+        # CFL substeps), so this is what keeps even long-pipe single-bank engines
+        # (e.g. the big tractor diesel) comfortably inside the real-time budget.
+        base_cells = min(240, max(80, cfg.pipe_length / 0.012))
+        N = int(np.clip(base_cells / nbanks, 56, 240))
+        pipe_area = math.pi / 4.0 * cfg.pipe_diameter ** 2
+        # acoustic end correction: an unflanged open pipe behaves ~0.61 radii
+        # longer than its physical length (Levine & Schwinger)
+        L_eff = cfg.pipe_length + 0.61 * (cfg.pipe_diameter / 2.0)
+        dx = L_eff / N
         P[core.P_NCELLS] = N
         P[core.P_DX] = dx
         P[core.P_PIPELEN] = cfg.pipe_length
-        pipe_area = math.pi / 4.0 * cfg.pipe_diameter ** 2
         P[core.P_PIPEAREA] = pipe_area
 
         # ---- muffler chamber acoustics (geometry-derived, lumped) ----
@@ -270,26 +298,47 @@ class EngineSim:
         # boom/drone, f_H = c/2pi * sqrt(A_neck/(V_chamber*L_neck)). The chamber
         # also kills high frequencies (transmission loss) -- a bigger box is
         # darker. Both come from the volume, not a tuned constant.
-        if cfg.muffler_volume < 0.0:
-            # straight pipe / open exhaust: no silencer (raw quarter-wave only)
+        # The silencer is now REAL geometry: the area profile A(x) built below
+        # carries an expansion chamber whose volume = the muffler volume, so the
+        # high-frequency transmission loss and the level drop (a straight pipe is
+        # several times louder) EMERGE from the quasi-1D wave solver. The old
+        # muffler one-pole LP (P_MUFFLP) is therefore redundant and disabled. A
+        # light per-engine body/Helmholtz resonance (P_BODYFREQ) is kept as voicing
+        # so the low boom stays present even where the single chamber notches it.
+        self._straight = cfg.muffler_volume < 0.0
+        if cfg.stroke_cycle == 2:
+            # 2-stroke: the tuned expansion chamber (built in the area profile) IS
+            # the exhaust -- it's a resonator, not an attenuating silencer, so no
+            # muffler loudness compensation and no synthetic Helmholtz body.
+            self._straight = False
+            self._muff_vol = 0.0
+            self._A_ch = pipe_area
             P[core.P_BODYFREQ] = 0.0
-            P[core.P_MUFFLP] = 0.0
-            self._muff_on = 0.0
+        elif self._straight:
+            self._muff_vol = 0.0                         # open/straight pipe
+            self._A_ch = pipe_area                       # no chamber
+            P[core.P_BODYFREQ] = 0.0                     # raw quarter-wave only
         else:
-            muff_vol = cfg.muffler_volume if cfg.muffler_volume > 0.0 \
-                else max(3.0e-3, 8.0 * Vd_total)     # ~8x displacement, >=3 L
+            self._muff_vol = cfg.muffler_volume if cfg.muffler_volume > 0.0 \
+                else max(3.0e-3, 8.0 * Vd_total)         # ~8x displacement, >=3 L
+            # expansion-chamber cross-section (spans ~28% of the pipe length); the
+            # solver makes the silencing/TL from this, no tuned filter.
+            L_ch = 0.28 * cfg.pipe_length
+            self._A_ch = float(np.clip(self._muff_vol / max(L_ch, 1e-3),
+                                       3.0 * pipe_area, 45.0 * pipe_area))
             c_ex = math.sqrt(GAMMA_EX * R_AIR * 700.0)   # hot-gas sound speed
             L_neck = 0.18                                # effective tailpipe neck
-            f_H = c_ex / (2.0 * math.pi) * math.sqrt(pipe_area / (muff_vol * L_neck))
+            f_H = c_ex / (2.0 * math.pi) * math.sqrt(
+                pipe_area / (self._muff_vol * L_neck))
             P[core.P_BODYFREQ] = float(np.clip(f_H, 45.0, 220.0))
-            # HF transmission-loss corner: lower for a bigger chamber. A turbo is
-            # a big HF absorber (the turbine muffles), so boosted engines sound
-            # darker/thumpier -- e.g. the quad-turbo W16 should rumble, not whine.
-            muff_corner = 7000.0 * (0.004 / muff_vol) ** 0.25
-            if cfg.turbo_boost > 0.0:
-                muff_corner *= 0.55
-            self._muff_on = float(np.clip(muff_corner, 800.0, 6500.0))
-            P[core.P_MUFFLP] = self._muff_on if self.mix_muffler else 0.0
+        # loudness compensation: a bigger chamber attenuates more, so without this
+        # a big-muffler engine would be far quieter than a small one. Normalising
+        # by the expansion ratio keeps perceived loudness consistent across presets
+        # while PRESERVING the chamber's spectral shaping (the TL notches).
+        self._muff_ratio = self._A_ch / pipe_area
+        self._turbo_muffles = cfg.turbo_boost > 0.0
+        P[core.P_MUFFLP] = 0.0                           # HF loss now from geometry
+        self._muff_on = 0.0
 
         # 1D intake duct (runner + airbox), coarser grid than exhaust to bound
         # CPU; 2-strokes use crankcase scavenge, so no duct (Ni=0).
@@ -354,10 +403,14 @@ class EngineSim:
             P[core.P_TRB_CELL] = 0.0
         P[core.P_DT] = 1.0 / SAMPLE_RATE
         P[core.P_SR] = SAMPLE_RATE
-        P[core.P_HT] = 6.0 * (Apist / 0.005)
+        # P_HT is now the Woschni heat-transfer gain (dimensionless); the
+        # correlation supplies the bore/pressure/velocity/temperature dependence.
+        P[core.P_HT] = 1.0
+        if cfg.diesel:
+            P[core.P_HT] = 1.15      # higher wall loss (cooler walls, CI mixing)
         P[core.P_WALLT] = self.T_metal      # wall temp tracks the metal (thermal model)
         P[core.P_DIESEL] = 1.0 if cfg.diesel else 0.0
-        P[core.P_DAMP] = 0.0015
+        P[core.P_DAMP] = 1.0        # wall-loss scale (1 = physical friction/heat)
         P[core.P_OUTGAIN] = 1.0 / 2600.0
         P[core.P_REDLINE] = cfg.redline_rpm
         P[core.P_RUNNING] = 0.0     # engine starts off — user cranks it
@@ -365,13 +418,24 @@ class EngineSim:
         P[core.P_LPF] = 0.55        # ~6.5 kHz one-pole output lowpass
         P[core.P_NOISE] = 0.06      # combustion cycle-to-cycle roughness
         P[core.P_POP] = 0.0         # overrun backfire intensity (set live)
-        self.backfire = 0.0         # user multiplier for backfire amount (off by default)
+        P[core.P_AFTERFIRE] = 0.0   # rich afterfire intensity (set live)
+        self.backfire = 0.3         # crackle/afterfire amount (overrun pops + rich flames)
         # fuelling / ignition / mechanical noise (set live each block)
         P[core.P_FUELCUT] = 0.0     # DFCO injection cut
         P[core.P_PHI] = 1.0         # commanded equivalence ratio (petrol)
-        # diesel compression-ignition clatters hard; petrol gets a faint edge.
-        # the "on" levels are stored so the mix toggles can restore them.
-        self._clatter_on = 0.55 if cfg.diesel else 0.05
+        # Clatter is NOT universal -- it's a character of specific engines, not a
+        # layer on everything. Diesels knock (CI) regardless of size; petrol clatter
+        # belongs to small/characterful engines (singles, twins, triples) and fades
+        # to ZERO on a refined 4+ cylinder petrol engine, which is smooth/creamy.
+        # (Air-cooled/agricultural petrol fours would clatter too, but that needs a
+        # per-engine flag; the cylinder heuristic covers the common cases.)
+        # the modal-body events (valve seats, slap) exist on EVERY engine, so a
+        # refined multi-cyl petrol keeps a subtle floor rather than zero.
+        if cfg.diesel:
+            self._clatter_on = 0.5 * float(np.clip(4.0 / ncyl, 0.5, 1.0))
+        else:
+            self._clatter_on = max(
+                0.10, 0.34 * float(np.clip((4 - ncyl) / 3.0, 0.0, 1.0)))
         self._knock_on = 0.0 if cfg.diesel else 0.30
         P[core.P_CLATTER] = self._clatter_on if self.mix_clatter else 0.0
         P[core.P_OCTANE] = cfg.octane
@@ -397,8 +461,15 @@ class EngineSim:
             cyl_bank[c] = min(nbanks - 1, c * nbanks // ncyl)
         self.cyl_bank = cyl_bank
         # summing banks adds level; trim output gain so V/W engines don't clip
-        self.bank_trim = 1.0 / (1.0 + 0.5 * (nbanks - 1))
-        P[core.P_OUTGAIN] = (1.0 / 2600.0) * self.bank_trim
+        self.bank_trim = 1.0 / (1.0 + 0.35 * (nbanks - 1))
+        # muffler loudness compensation (see _build muffler section): partly boost
+        # back the level a big expansion chamber removes so presets aren't wildly
+        # mismatched -- but only PARTLY (exp 0.18), since a big silencer really is
+        # quieter, and the old 0.32 over-boosted big-muffler diesels into clipping.
+        # output scale: the radiated signal is physical Pa at a 1 m mic, so
+        # full-scale 1.0 ~= 40 Pa ~= 126 dB SPL (close-mic'd engine).
+        muff_comp = self._muff_ratio ** 0.18
+        P[core.P_OUTGAIN] = (1.0 / 300.0) * self.bank_trim * muff_comp
 
         self.P = P
         self.N = N
@@ -441,6 +512,7 @@ class EngineSim:
         self.idle_i = 0.0
         self.shift_timer = 0.0
         self.crank_timer = 0.0
+        self.crank_assist = 0.0
         self.boost = 0.0
         self.thr_smooth = 0.0
         self.clutch_engage = 0.0
@@ -451,7 +523,18 @@ class EngineSim:
         self.cyl_T = np.full(ncyl, TINT)
         self.cyl_m = np.full(ncyl, PATM * Vmid / (R_AIR * TINT))
         # per-cylinder knock state: [T_ivc, P_ivc, Livengood-Wu integral, knocked]
-        self.cyl_knk = np.zeros((ncyl, 4))
+        # per-cylinder trapped reference + knock state:
+        # [T_ivc, P_ivc, Livengood-Wu integral, knocked, V_ivc, spare]
+        self.cyl_knk = np.zeros((ncyl, 6))
+        # static per-cylinder combustion trim (fuelling/compression spread):
+        # the engine's permanent identity -- deterministic per geometry, so the
+        # same preset always has the same half-order signature (V8 burble,
+        # diesel lope), not a new lottery every run.
+        rng = np.random.default_rng(ncyl * 7919 + int(cfg.bore * 1e6) % 7919)
+        self.cyl_trim = 1.0 + 0.025 * rng.standard_normal(ncyl)
+        # per-cylinder cycle state: [AR(1) wander, current-cycle burn quality]
+        self.cyl_var = np.zeros((ncyl, 2))
+        self.cyl_var[:, 1] = 1.0
 
         rho0 = PATM / (R_AIR * TATM)
         self.rho = np.full((nbanks, N), rho0)
@@ -466,10 +549,8 @@ class EngineSim:
         self.Ene_in = np.full(nin, PATM / (GAMMA_CYL - 1.0))
 
         # per-cylinder intake-runner ram state: column mass flow (starts at rest),
-        # runner-port gas mass (starts at plenum density), fresh-charge accumulator
-        v_port = P[core.P_RUN_AREA] * P[core.P_RUN_LEN]
+        # fresh-charge accumulator
         self.run_mdot = np.zeros(ncyl)
-        self.port_m = np.full(ncyl, rho_in0 * max(v_port, 1e-9))
         self.fresh = np.zeros(ncyl)
 
         # mode-2 per-cylinder 1D runner cells (cool air at rest, at MAP/plenum).
@@ -480,13 +561,113 @@ class EngineSim:
         self.src_rm = np.zeros((ncyl, Nr))
         self.src_re = np.zeros((ncyl, Nr))
 
+        # ---- quasi-1D cross-section profiles A(x) for the MUSCL-Hancock solver.
+        # The exhaust profile (header -> collector -> muffler -> tailpipe) is built
+        # by _exhaust_area_profile so silencer transmission loss and tuning emerge
+        # from geometry. Intake duct and runners are (for now) constant-area.
+        self.ex_area = self._exhaust_area_profile(N, pipe_area)
+        self.ex_aface = self._faces(self.ex_area)
+        self.ex_wk = np.zeros((15, N))
+        self.in_area = np.full(nin, in_area)
+        self.in_aface = self._faces(self.in_area)
+        self.in_wk = np.zeros((15, nin))
+        run_a = P[core.P_RUN_AREA] if P[core.P_RUN_AREA] > 0.0 else 1e-4
+        self.run_area_a = np.full(Nr, run_a)
+        self.run_aface = self._faces(self.run_area_a)
+        self.run_wk = np.zeros((15, Nr))
+
+        # ---- physical pipe wall losses (per cell, from the local diameter) ----
+        # turbulent Darcy friction f/(2D) (1/m). Wall heat loss uses the
+        # REYNOLDS ANALOGY: its coefficient is the same f/(2D), and the core
+        # multiplies by the local |u| -- heat exchange rides on the forced
+        # convection, so a stopped pipe stops exchanging (no chimney pumping).
+        F_DARCY = 0.032
+        D_ex = np.sqrt(4.0 * self.ex_area / math.pi)
+        self.ex_fric = F_DARCY / (2.0 * D_ex)
+        self.ex_cool = self.ex_fric.copy()
+        D_in = np.sqrt(4.0 * self.in_area / math.pi)
+        self.in_fric = F_DARCY / (2.0 * D_in)
+        self.in_cool = self.in_fric.copy()
+        D_run = np.sqrt(4.0 * self.run_area_a / math.pi)
+        self.run_fric = F_DARCY / (2.0 * D_run)
+        self.run_cool = self.run_fric.copy()
+        # grid-scale HF dissipation per cell: a small boundary-layer base level
+        # everywhere, plus ABSORPTIVE PACKING inside the silencer chamber (the
+        # fibre wool of a real muffler eats high frequencies in the chamber but
+        # leaves the lows -- that's where the dark/refined exhaust tone comes
+        # from). A 2-stroke chamber is a REFLECTIVE tuned cone, so no packing.
+        HF_BASE = 0.02
+        HF_PACK = 0.16
+        self.ex_hf = np.full(N, HF_BASE)
+        if cfg.stroke_cycle == 4 and not self._straight:
+            chamber = self.ex_area > 2.5 * pipe_area
+            self.ex_hf[chamber] = HF_PACK
+        self.in_hf = np.full(nin, HF_BASE)
+        self.run_hf = np.full(Nr, HF_BASE)
+        # open-end reflection filter states (Levine-Schwinger termination):
+        # one per exhaust bank, one for the intake mouth, one per runner.
+        self.bc_ex = np.zeros(nbanks)
+        self.bc_in = np.zeros(1)
+        self.bc_run = np.zeros(ncyl)
+
         self.scope_p = np.full(N_SCOPE, PATM)
-        # output filter state: exhaust DC block (0,1), de-hash LPF (2,3),
-        # body/thump resonator (4,5); induction DC block (6,7), de-hash LPF (8,9);
-        # combustion-clatter resonators (12,13) and (14,15); knock ping (16,17);
-        # muffler chamber LP (18)
-        self.filt = np.zeros(20)
+        # output filter state: exhaust mdot-prev (0) + DC block (1,21), de-hash
+        # LPF (2,3), body/thump resonator (4,5); induction mdot-prev (6) + DC
+        # block (7,22), de-hash LPF (8,9); peak-limiter envelope (10) + gain
+        # (11); combustion-clatter resonators (12,13) and (14,15); knock ping
+        # (16,17); muffler chamber LP (18); clatter impact envelope (19)
+        # 24-35: modal-body mode states (6 SVFs); 36: impact contact-noise env
+        self.filt = np.zeros(40)
+        self.filt[11] = 1.0          # limiter gain starts at unity
         self.P[core.P_MAP] = PATM
+
+    @staticmethod
+    def _faces(area):
+        """Face areas (N+1) from cell areas (N): interior faces are the average
+        of the two neighbours; the two ends take the end-cell area."""
+        N = len(area)
+        af = np.empty(N + 1)
+        af[0] = area[0]
+        af[N] = area[N - 1]
+        for k in range(1, N):
+            af[k] = 0.5 * (area[k - 1] + area[k])
+        return af
+
+    def _exhaust_area_profile(self, N, pipe_area):
+        """Cross-section A(x) along the exhaust, head cell (x=0, at the ports) ->
+        tailpipe outlet (x=1). The quasi-1D solver turns this geometry into real
+        wave action: an expansion chamber reflects and traps energy (the silencer
+        boom + high-frequency transmission loss) and the cones tune a 2-stroke.
+
+        Control points (xpos, area) are linearly interpolated -- area transitions
+        are physical cones, and the chamber volume is sized to the muffler volume
+        so the boom frequency tracks the real box size, no tuned constant."""
+        cfg = self.cfg
+        L = cfg.pipe_length
+        xc = (np.arange(N) + 0.5) / N
+        if cfg.stroke_cycle == 2:
+            # 2-stroke tuned pipe: header -> diverging cone -> belly -> converging
+            # cone -> stinger. The belly/cone reflections are the "braaap" and the
+            # scavenging resonance; the tiny stinger sets back-pressure.
+            belly = pipe_area * 6.0
+            stinger = pipe_area * 0.42
+            xs = [0.0, 0.12, 0.45, 0.58, 0.86, 1.0]
+            ars = [pipe_area, pipe_area, belly, belly, stinger, stinger]
+        elif self._straight:
+            # open / straight pipe: a mild collector step then constant bore
+            # (raw quarter-wave resonator, bright and loud -- no silencing)
+            xs = [0.0, 0.30, 1.0]
+            ars = [pipe_area, pipe_area, pipe_area]
+        else:
+            # 4-stroke with silencer: header+collector -> expansion chamber sized
+            # to the muffler volume -> tailpipe. Chamber spans ~28% of the length;
+            # A_ch * (0.28 L) = muffler volume, so the chamber resonance/boom and
+            # the expansion-ratio transmission loss both come from the real box.
+            A_ch = self._A_ch                            # sized in _build
+            A_tail = 0.8 * pipe_area
+            xs = [0.0, 0.50, 0.56, 0.84, 0.90, 1.0]
+            ars = [pipe_area, pipe_area, A_ch, A_ch, A_tail, A_tail]
+        return np.interp(xc, xs, ars)
 
     # ------------------------------------------------------------- live tuning
     def set_throttle(self, v):
@@ -556,6 +737,16 @@ class EngineSim:
             self.rpm_rate += ((rpm - self.rpm_prev) / dt - self.rpm_rate) * 0.3
         self.rpm_prev = rpm
 
+        # ---- governor idle speed: a low-passed rpm (the MEAN idle speed). A
+        # low-inertia, uneven-firing engine (cross-plane I4, V-twin, V4) swings the
+        # instantaneous block rpm by hundreds; regulating that raw value used to
+        # saturate the loop on every firing spike and ratchet the idle UP. The
+        # governor instead tracks this filtered speed and a rate derived from it. ----
+        a_gov = min(1.0, dt / 0.12)
+        self.rpm_gov += (rpm - self.rpm_gov) * a_gov
+        gov_rate = (self.rpm_gov - self._rpm_gov_prev) / dt if dt > 0.0 else 0.0
+        self._rpm_gov_prev = self.rpm_gov
+
         if self.shift_timer > 0.0:
             self.shift_timer = max(0.0, self.shift_timer - dt)
 
@@ -570,13 +761,24 @@ class EngineSim:
             starter = self.starter_torque
             demand = 0.25
             self.crank_timer += dt
-            if rpm > 0.7 * idle:
+            if rpm > 0.85 * idle:
                 self.state = "running"
                 self.idle_i = 0.08          # seed near the idle-hold demand
+                self.crank_assist = 0.6     # starter overlap window (s)
             elif self.crank_timer > 3.0:
                 self.state = "off"          # failed to catch
         else:  # running
             running = 1.0
+            # starter overlap: keep the cranking motor assisting for a short window
+            # after catch, tapering out as rpm rises toward idle. A real starter
+            # stays meshed until the engine clearly runs; this bridges the first
+            # few compression strokes that would otherwise stall a low-inertia,
+            # high-CR single/twin before combustion has stabilised.
+            if self.crank_assist > 0.0:
+                self.crank_assist = max(0.0, self.crank_assist - dt)
+                if rpm < 1.15 * idle:
+                    starter = self.starter_torque * float(
+                        np.clip((1.15 * idle - rpm) / (1.15 * idle), 0.0, 1.0))
             if self.pedal < 0.03:
                 # idle-air governor: proportional-dominated PI. The rpm plant is
                 # an integrator, so a gentle P term does the regulating and a
@@ -586,38 +788,50 @@ class EngineSim:
                 # PID idle governor. The plant (manifold->torque->rpm) lags, so
                 # a derivative term on rpm rate damps the overshoot. The TARGET is
                 # raised when cold (ECU fast idle), set by the thermal model.
+                # PI-D idle governor on the FILTERED idle speed (rpm_gov). The
+                # plant (idle-air -> manifold -> torque -> inertia) is a lagged
+                # integrator, so a proportional term regulates, a rate (derivative)
+                # term damps the manifold lag, and a slow integral trims the steady
+                # idle air with CONDITIONAL anti-windup (it stops integrating only
+                # when that would push further into a saturated actuator -- so it no
+                # longer ratchets up on a noisy, low-inertia engine). The PLANT is
+                # real physics; this is just the ECU's idle valve / fuel trim.
                 idle_t = self.idle_target
-                err = (idle_t - rpm) / idle_t
+                err = (idle_t - self.rpm_gov) / idle_t
+                rate_norm = gov_rate / idle_t          # per-second, normalised
+                # gains scale with inertia: damping (kp,kd) must GROW with the
+                # flywheel and the integral (ki) SHRINK, else a huge-inertia plant
+                # (a 9 kg.m^2 bus diesel) goes under-damped and limit-cycles, while
+                # a tiny bike flywheel needs a gentle proportional. sq = sqrt(I/Iref).
+                # Only a big flywheel deviates from the baseline gains: damping
+                # (kp,kd) is floored at the baseline and RAISED with inertia, the
+                # integral (ki) is ceiled at the baseline and LOWERED. So the small
+                # low-inertia engines keep the well-behaved baseline loop and the
+                # huge diesels get the extra damping / gentler integral they need.
+                sq = (cfg.inertia / 0.2) ** 0.5
                 if cfg.diesel:
-                    # Diesel torque tracks fuel near-instantly, so the loop can be
-                    # tight -- but the old gains hunted (a slow idle limit cycle).
-                    # A strong derivative (rpm-rate) term plus a faster injection
-                    # actuator (below) damps it; the integral trims steady fuel.
-                    # flat integral authority (the inertia scaling drooped big
-                    # engines and over-fuelled small ones); a slow rpm-rate
-                    # derivative damps the hunt without freezing the integrator.
-                    ki = 0.6
-                    demand = float(np.clip(
-                        self.idle_i + 0.09 * err - 0.8e-4 * self.rpm_rate, 0.0, 0.95))
-                    if 0.0 < demand < 0.95:
-                        self.idle_i = float(np.clip(self.idle_i + err * dt * ki,
-                                                    0.0, 0.9))
+                    kp = 0.13 * float(np.clip(sq, 1.0, 5.0))
+                    kd = 0.016 * float(np.clip(sq, 1.0, 9.0))
+                    ki = 0.55 * float(np.clip(1.0 / sq, 0.14, 1.0))
+                    imax = 0.9
                 else:
-                    # Petrol: a heavy engine is a SLOW rotational plant (throttle
-                    # -> manifold -> torque -> inertia). To stay critically damped
-                    # the derivative lead must grow with inertia (~sqrt, the result
-                    # for a PI loop on an integrator). With that damping the
-                    # integral no longer has to be crippled, so it reaches the
-                    # idle-air the engine needs -- curing both hunting AND droop.
-                    inr = cfg.inertia / 0.2
-                    kd = 3.0e-5 * max(1.0, inr ** 0.5)
-                    ki = 0.40 * float(np.clip((0.2 / max(0.01, cfg.inertia)) ** 0.5,
-                                              0.35, 1.0))
-                    demand = float(np.clip(
-                        self.idle_i + 0.16 * err - kd * self.rpm_rate, 0.0, 0.95))
-                    if 0.0 < demand < 0.95:
-                        self.idle_i = float(np.clip(self.idle_i + err * dt * ki,
-                                                    0.0, 0.85))
+                    # kp is only MODERATELY raised with inertia (clamp 2.5): the
+                    # heaviest petrol flywheel (the 4 kg.m^2 radial) is gain-limited
+                    # by the manifold/filter lag, so too much proportional gain makes
+                    # it slow-hunt. The integral is cut and the derivative damping
+                    # kept -- a sweep put the radial's idle swing at its minimum here.
+                    kp = 0.16 * float(np.clip(sq, 1.0, 2.5))
+                    kd = 0.020 * float(np.clip(sq, 1.0, 9.0))
+                    ki = 0.45 * float(np.clip(1.0 / sq, 0.14, 1.0))
+                    imax = 0.85
+                raw = self.idle_i + kp * err - kd * rate_norm
+                demand = float(np.clip(raw, 0.0, 0.95))
+                # conditional integration: skip only when winding further into a stop
+                sat_hi = demand >= 0.95 and err > 0.0
+                sat_lo = demand <= 0.0 and err < 0.0
+                if not (sat_hi or sat_lo):
+                    self.idle_i = float(np.clip(self.idle_i + err * dt * ki,
+                                                -0.05, imax))
             else:
                 demand = self.pedal
                 self.idle_i = float(np.clip(self.idle_i, 0.04, 0.7))
@@ -694,18 +908,30 @@ class EngineSim:
                 phi += 0.035 * math.sin(self.lambda_phase)
             P[core.P_PHI] = phi
 
-        # ---- overrun backfire intensity (closed throttle, elevated rpm) ----
+        # ---- afterfire / crackle (one knob drives both mechanisms) ----
+        # Overrun pops (lean, decel): on a closed throttle above idle. Rich
+        # afterfire (over-fuel flames): whenever the petrol mixture is rich, the
+        # core fires it off a hot pipe. self.backfire is the user "crackle/flame"
+        # amount; the decel pops also scale with rpm (more violent higher up).
         pop = 0.0
         if self.state == "running" and self.pedal < 0.06 and rpm > idle * 1.8:
             pop = float(np.clip((rpm - idle * 1.8) / max(1.0, cfg.redline_rpm),
                                 0.0, 1.0)) * self.backfire
         P[core.P_POP] = pop
+        P[core.P_AFTERFIRE] = self.backfire if not cfg.diesel else 0.0
 
         # ---- intake feed: set throttle area + PRE-compressor feed pressure ----
         # Turbo boost is no longer scripted here -- it emerges in the core from
         # the turbo shaft's power balance. We only supply the feed pressure
         # (atmosphere, or 2-stroke crankcase) and the throttle area.
         if cfg.diesel:
+            # max-speed governor: a diesel does NOT bounce a hard rev-cut limiter
+            # (that warbles/buzzes, esp. a high-torque low-redline tractor). It
+            # smoothly pulls fuel over a droop band as it approaches the governed
+            # speed, so it just stops accelerating cleanly at redline.
+            droop = max(80.0, 0.06 * cfg.redline_rpm)
+            gov = float(np.clip((rpm - (cfg.redline_rpm - droop)) / droop, 0.0, 1.0))
+            demand *= (1.0 - gov)
             P[core.P_PBOOST] = PATM
             P[core.P_THRAREA] = self.thr_area_max      # no throttle plate
             # common-rail injection responds fast (ms); a small lag only
@@ -719,8 +945,11 @@ class EngineSim:
         else:
             P[core.P_PBOOST] = PATM
             # progressive throttle plate: area ~ demand^2 gives fine resolution
-            # near idle (gentle loop gain) and full bore at WOT, like a real body
-            P[core.P_THRAREA] = self.thr_area_max * (0.0008 + 0.9992 * demand * demand)
+            # near idle (gentle loop gain) and full bore at WOT, like a real body.
+            # The idle leak (idle_floor) is scaled per engine so even big-valve,
+            # high-rev bikes can be governed down to their target idle.
+            P[core.P_THRAREA] = self.thr_area_max * (
+                self.idle_floor + (1.0 - self.idle_floor) * demand * demand)
             P[core.P_THROTTLE] = demand
 
         # ---- driveline / vehicle inputs for the coupled core integration ----
@@ -806,18 +1035,29 @@ class EngineSim:
         P[core.P_STARTER] = starter
 
     # ------------------------------------------------------------------ stepping
-    def step_block(self, n):
-        out = np.zeros(n, dtype=np.float64)
+    def step_block(self, n, out=None):
+        # the audio callback passes a preallocated buffer so the latency-critical
+        # path does no per-block allocation; simulate_block overwrites every sample
+        if out is None or len(out) != n:
+            out = np.zeros(n, dtype=np.float64)
         with self.lock:
             self._control_update(n / SAMPLE_RATE)
             t = simulate_block(n, self.P, self.st, self.cyl_m, self.cyl_T,
                                self.phase, self.inj, self.cyl_bank,
                                self.rho, self.mom,
                                self.Ene, self.rho_in, self.mom_in, self.Ene_in,
-                               self.run_mdot, self.port_m, self.fresh, self.cyl_knk,
+                               self.run_mdot, self.fresh, self.cyl_knk,
+                               self.cyl_trim, self.cyl_var,
                                self.rho_r, self.mom_r, self.Ene_r,
                                self.src_rm, self.src_re,
-                               out, self.scope_p, N_SCOPE, self.filt)
+                               out, self.scope_p, N_SCOPE, self.filt,
+                               self.ex_area, self.ex_aface, self.ex_wk,
+                               self.in_area, self.in_aface, self.in_wk,
+                               self.run_area_a, self.run_aface, self.run_wk,
+                               self.ex_fric, self.ex_cool, self.ex_hf,
+                               self.in_fric, self.in_cool, self.in_hf,
+                               self.run_fric, self.run_cool, self.run_hf,
+                               self.bc_ex, self.bc_in, self.bc_run)
             self.torque = float(t)
             self.rpm = self.st[core.S_OMEGA] * 60.0 / (2.0 * math.pi)
             self.v = float(self.st[core.S_V])
@@ -899,26 +1139,30 @@ class EngineSim:
 
     # -------------------------------------------------------------------- audio
     def _callback(self, outdata, frames, time_info, status):
+        # Allocation-free hot path: reuse a preallocated buffer and do the guard /
+        # soft-limit in place. Per-block heap churn here (or in step_block) shows
+        # up as periodic buffer underruns -- the audio dropping out at a regular
+        # rate -- so the whole callback avoids creating temporaries.
+        cb = self._cb_buf if frames == len(self._cb_buf) else None
         try:
-            out = self.step_block(frames)
+            out = self.step_block(frames, out=cb)
         except Exception:
             outdata.fill(0.0)
             return
-        # guard against any non-finite value reaching the sound card
-        out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-        # soft limiter
-        y = np.tanh(out * self.volume)
-        outdata[:, 0] = y.astype(np.float32)
-        # store tail for waveform display
+        np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+        np.multiply(out, self.volume, out=out)
+        np.tanh(out, out=out)                       # soft limiter, in place
+        outdata[:, 0] = out                         # float64 -> float32 on assign
+        # store tail for the waveform display (ring buffer; plain slice copies)
         tp = self._tap_pos
-        n = len(y)
+        n = len(out)
         buf = self.audio_tap
         if tp + n <= len(buf):
-            buf[tp:tp + n] = y
+            buf[tp:tp + n] = out
         else:
             k = len(buf) - tp
-            buf[tp:] = y[:k]
-            buf[:n - k] = y[k:]
+            buf[tp:] = out[:k]
+            buf[:n - k] = out[k:]
         self._tap_pos = (tp + n) % len(buf)
 
     def start_audio(self):
