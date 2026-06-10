@@ -1391,21 +1391,32 @@ def simulate_block(n_samples, P, st, cyl_m, cyl_T, phase, inj, cyl_bank,
         # summed banks' exit MASS-FLOW (a monopole source: what the pipe blows
         # into the air is what you hear, as d(mdot)/dt at the listener) -- the
         # bank-to-bank cadence (cross-plane bank split) gives the V8/W16 rumble.
+        # spread the valve sources EVENLY over the CFL substeps (continuity:
+        # the valve flows for the whole sample, not for one substep). The
+        # once-per-substep impulse made every exhaust pulse a sample-rate
+        # step whose broadband hash the d(mdot)/dt radiation tap then
+        # DIFFERENTIATED (+6 dB/oct) -- the same mechanism already fixed on
+        # the intake ("most of the induction buzz"), never applied here:
+        # every muffler/cat rung downstream was fighting a numerically
+        # sharpened source.
+        inv_sub = 1.0 / nsub
         for b in range(nbanks):
             mdot_b[b] = 0.0
+            for k in range(N):
+                src_m[b, k] *= inv_sub
+                src_E[b, k] *= inv_sub
         for _ in range(nsub):
             for b in range(nbanks):
                 gas_step_q(rho[b], mom[b], Ene[b], N, dx, dt_gas, gex, Rex,
                            patm, Tatm, patm, Tatm, damp, pk_ex, src_m[b],
                            src_E[b], pa_ex, fa_ex, wk_ex, bnd_ex[b],
                            vt_ex[b], vt_K, vt_w)
-            # sources are an impulse for the whole sample; apply only once
-            for b in range(nbanks):
-                for k in range(N):
-                    src_m[b, k] = 0.0
-                    src_E[b, k] = 0.0
             for b in range(nbanks):
                 mdot_b[b] += mom[b, N - 1] * fa_ex[N]   # rho*u*A at the exit
+        for b in range(nbanks):
+            for k in range(N):
+                src_m[b, k] = 0.0
+                src_E[b, k] = 0.0
 
         # ---- turbulent afterfire ignition (random in time, NOT valve-locked).
         # A flammable pocket ignites when turbulent mixing folds it onto hot
