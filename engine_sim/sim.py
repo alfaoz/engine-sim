@@ -423,17 +423,16 @@ class EngineSim:
         # fuelling / ignition / mechanical noise (set live each block)
         P[core.P_FUELCUT] = 0.0     # DFCO injection cut
         P[core.P_PHI] = 1.0         # commanded equivalence ratio (petrol)
-        # Mechanical/combustion noise through the block is universal -- EVERY
-        # engine's pressure rise rings its structure; without it a 4+ cyl petrol
-        # car was exhaust-pipe-only and sounded like a resonant balloon. The old
-        # (4-ncyl)/3 fade that zeroed cars out was a synthetic gate masking the
-        # layer, not physics. Character differences come from the excitation
-        # itself: per-event dQ/V (sharp for CI diesel, soft for SI), event rate,
-        # and the bore-scaled body resonances -- not from a per-ncyl level curve.
+        # Clatter is NOT universal -- it's a character of specific engines, not a
+        # layer on everything. Diesels knock (CI) regardless of size; petrol clatter
+        # belongs to small/characterful engines (singles, twins, triples) and fades
+        # to ZERO on a refined 4+ cylinder petrol engine, which is smooth/creamy.
+        # (Air-cooled/agricultural petrol fours would clatter too, but that needs a
+        # per-engine flag; the cylinder heuristic covers the common cases.)
         if cfg.diesel:
             self._clatter_on = 0.5 * float(np.clip(4.0 / ncyl, 0.5, 1.0))
         else:
-            self._clatter_on = 0.34
+            self._clatter_on = 0.34 * float(np.clip((4 - ncyl) / 3.0, 0.0, 1.0))
         self._knock_on = 0.0 if cfg.diesel else 0.30
         P[core.P_CLATTER] = self._clatter_on if self.mix_clatter else 0.0
         P[core.P_OCTANE] = cfg.octane
