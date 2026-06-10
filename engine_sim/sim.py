@@ -335,13 +335,21 @@ class EngineSim:
             self._A_ch = pipe_area                       # no chamber
             P[core.P_BODYFREQ] = 0.0                     # raw quarter-wave only
         else:
+            # default box ~8x displacement; the floor scales with the engine
+            # (a moped carries ~a 1 L can, not a 3 L sedan box -- the flat
+            # 3 L floor put a 43:1 expansion on a 2 cm pipe and blew up the
+            # 50cc's tail cone at WOT)
             self._muff_vol = cfg.muffler_volume if cfg.muffler_volume > 0.0 \
-                else max(3.0e-3, 8.0 * Vd_total)         # ~8x displacement, >=3 L
-            # expansion-chamber cross-section (spans ~28% of the pipe length); the
-            # solver makes the silencing/TL from this, no tuned filter.
-            L_ch = 0.28 * cfg.pipe_length
+                else max(1.2e-3, 8.0 * Vd_total)
+            # expansion-chamber cross-section (the chamber zone spans ~26% of
+            # the pipe length incl. cones; see _exhaust_area_profile for the
+            # two-chamber split); the solver makes the silencing/TL from
+            # this, no tuned filter.
+            L_ch = 0.26 * cfg.pipe_length
+            # expansion ratio capped at a BUILDABLE 20:1 (4.5x diameter --
+            # real shells; 45:1 was a numerical hand grenade on small pipes)
             self._A_ch = float(np.clip(self._muff_vol / max(L_ch, 1e-3),
-                                       3.0 * pipe_area, 45.0 * pipe_area))
+                                       3.0 * pipe_area, 20.0 * pipe_area))
             c_ex = math.sqrt(GAMMA_EX * R_AIR * 700.0)   # hot-gas sound speed
             L_neck = 0.18                                # effective tailpipe neck
             f_H = c_ex / (2.0 * math.pi) * math.sqrt(
@@ -623,7 +631,12 @@ class EngineSim:
         # survival per pass.)
         self.pk_ex = np.zeros(N)
         if cfg.stroke_cycle == 4 and not self._straight:
-            self.pk_ex[self.ex_area > 1.5 * pipe_area] = 0.006
+            # packing fills the SHELL span (0.50..0.88+cones), neck included:
+            # a real box's internals run wall to wall. The old area-based
+            # rule left the inter-chamber neck unpacked -- a high-Q cavity
+            # between two near-perfect mirrors.
+            xc_pk = (np.arange(N) + 0.5) / N
+            self.pk_ex[(xc_pk > 0.50) & (xc_pk < 0.94)] = 0.006
         self.pk_in = np.zeros(max(1, Ni))
         self.pk_run = np.zeros(self.Nr)
 
@@ -688,15 +701,55 @@ class EngineSim:
             xs = [0.0, 0.30, 1.0]
             ars = [pipe_area, pipe_area, pipe_area]
         else:
-            # 4-stroke with silencer: header+collector -> expansion chamber sized
-            # to the muffler volume -> tailpipe. Chamber spans ~28% of the length;
-            # A_ch * (0.28 L) = muffler volume, so the chamber resonance/boom and
-            # the expansion-ratio transmission loss both come from the real box.
+            # 4-stroke with silencer: header+collector -> TWO expansion
+            # chambers of unequal length -> tailpipe. A single chamber has
+            # transmission-loss ZEROS (pass bands) at k*L_ch = n*pi -- for a
+            # city car that put the first one at ~770 Hz, right in the
+            # midband, and the firing comb sailed through it ("sounds racey
+            # even with a muffler"). Real OEM silencers stage chambers of
+            # unequal lengths so the pass bands never align: each chamber's
+            # zero falls in the other's stop band. Lengths split 1:1.618
+            # (incommensurate -> no common harmonics), joined by a pipe-bore
+            # neck. All geometry -- the solver makes the staged TL.
+            # EVERY transition is sized in CELLS (>= 2.5) so a 31:1 area
+            # change is never steeper than the grid can carry: a sub-cell
+            # cone turns the quasi-1D p*dA wall force into a violent
+            # single-cell impulse (the first cut clipped a 2-bank V8 whose
+            # 83-cell grid made the 1%-wide cones sub-cell).
             A_ch = self._A_ch                            # sized in _build
             A_tail = 0.8 * pipe_area
-            xs = [0.0, 0.50, 0.56, 0.84, 0.90, 1.0]
-            ars = [pipe_area, pipe_area, A_ch, A_ch, A_tail, A_tail]
-        return np.interp(xc, xs, ars)
+            s = max(0.03, 2.5 / N)        # one resolvable transition width
+            flat = 0.38 - 5.0 * s         # chamber zone 0.50..0.88 minus cones
+            if flat > 4.0 * s:
+                # two staged chambers, lengths 1 : 1.618
+                L1 = flat / 2.618
+                L2 = flat - L1
+                p1 = 0.50 + 2.0 * s       # cone up done -> ch1
+                p2 = p1 + L1              # ch1 done
+                p3 = p2 + s               # cone down -> neck
+                p4 = p3 + s               # neck done
+                p5 = p4 + s               # cone up -> ch2
+                p6 = p5 + L2              # = 0.88, ch2 done
+                xs = [0.0, 0.50, p1, p2, p3, p4, p5, p6,
+                      p6 + 2.0 * s, 1.0]
+                ars = [pipe_area, pipe_area, A_ch, A_ch, pipe_area,
+                       pipe_area, A_ch, A_ch, A_tail, A_tail]
+            else:
+                # grid too coarse for staging (heavily split multi-bank
+                # exotics): single chamber, transitions still >= 2.5 cells
+                xs = [0.0, 0.50, 0.50 + 2.0 * s, 0.88, 0.88 + 2.0 * s, 1.0]
+                ars = [pipe_area, pipe_area, A_ch, A_ch, A_tail, A_tail]
+        prof = np.interp(xc, xs, ars)
+        # slope limit: adjacent cells never differ by more than 1.6x, so no
+        # cone is ever steeper than the grid resolves (the quasi-1D p*dA
+        # wall force across a sub-cell 40:1 step is an impulse, not a cone)
+        for k in range(1, N):
+            if prof[k] > 1.6 * prof[k - 1]:
+                prof[k] = 1.6 * prof[k - 1]
+        for k in range(N - 2, -1, -1):
+            if prof[k] > 1.6 * prof[k + 1]:
+                prof[k] = 1.6 * prof[k + 1]
+        return prof
 
     # ------------------------------------------------------------- live tuning
     def _radiation_geom(self):
