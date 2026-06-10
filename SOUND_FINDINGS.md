@@ -228,11 +228,21 @@ pitch/depth with the slider, the static comb is convicted. Fix
 direction then: diffuse/scattered ground image (asphalt + underbody
 scatter, not a perfect mirror), NOT more pipe work.
 
+RESOLVED by user A/B: the robotic V8 'electric motor' = INDUCTION
+(unchecking the box kills it; mic-distance shift was a red herring --
+induction rides outgain too). The constant-area duct was a bare organ
+pipe comb. Fix `2d808bb`: airbox (~9x disp) + filter element (linear
+loss, 1 kPa @ peak flow spec) + snorkel; radiating mouth now after the
+box. 500-1200 Hz -4 dB. The static-comb/diffuse-ground-image idea was
+NOT convicted -- do not build it on this evidence.
+
 Queued next:
-1. USER: mic-distance comb test on the muffled V8 (above) + verdict on
-   the long-box V8 voice (one real muffler now, was two stubs).
-2. If comb convicted: diffuse ground-image reflection (physical
-   scattering) as the next single rung.
+1. USER LISTENS: muffled V8 with Induction ON (the electric-motor
+   test); 1.2 city rev-down (long-box + everything); general pass.
+2. Overrun slosh band: remaining honest lever is overrun MAP (real
+   ~15-20 kPa vs our 5-8); needs a derivable law, none found yet.
+3. Straight pipes 'tubey' (user: may be normal -- it partly is; low
+   priority).
 2. Muffler shell radiation (mass-law transmission from chamber cells) —
    derived replacement for the rejected synthetic body resonator.
 3. Per-cylinder exhaust primaries -> collector (full header geometry) —
