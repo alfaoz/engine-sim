@@ -606,10 +606,54 @@ class EngineSim:
         # ---- quasi-1D cross-section profiles A(x) for the MUSCL-Hancock solver.
         # The exhaust profile (header -> collector -> muffler -> tailpipe) is built
         # by _exhaust_area_profile so silencer transmission loss and tuning emerge
-        # from geometry. Intake duct and runners are (for now) constant-area.
+        # from geometry.
         self._rebuild_exhaust_geometry()
         self.ex_wk = np.zeros((15, N))
+        # ---- intake duct: runner -> AIRBOX + filter -> snorkel ----
+        # A bare constant-area duct is an organ pipe: its modes excited at
+        # the firing rate made the induction read as an electric-motor
+        # whine (user-convicted via the Induction checkbox on the muffled
+        # V8). A real intake breathes through an airbox (~9x displacement,
+        # the NA intake-design rule of thumb) whose volume de-tunes the
+        # duct comb, with the paper filter element adding LINEAR viscous
+        # loss (laminar through the pleats), sized from the standard
+        # clean-element spec: ~1.0 kPa pressure drop at peak engine flow.
+        # Geometry only -- the whine fix emerges from the box, no filter
+        # on the signal. Duct head (cell 0) = plenum side; mouth = air.
         self.in_area = np.full(nin, in_area)
+        self.pk_in = np.zeros(max(1, Ni))
+        if Ni > 0:
+            xi = (np.arange(Ni) + 0.5) / Ni
+            V_box = max(3.0e-3, 9.0 * Vd_total)         # airbox volume
+            L_box = 0.25 * in_len                       # box span (m)
+            A_box = float(np.clip(V_box / max(L_box, 0.05),
+                                  3.0 * in_area, 40.0 * in_area))
+            A_snork = 0.8 * in_area
+            si = max(0.04, 2.5 / Ni)
+            xs_i = [0.0, 0.55, 0.55 + 2.0 * si, 0.80,
+                    0.80 + 2.0 * si, 1.0]
+            ar_i = [in_area, in_area, A_box, A_box, A_snork, A_snork]
+            prof = np.interp(xi, xs_i, ar_i)
+            for k in range(1, Ni):                      # resolvable cones
+                if prof[k] > 1.6 * prof[k - 1]:
+                    prof[k] = 1.6 * prof[k - 1]
+            for k in range(Ni - 2, -1, -1):
+                if prof[k] > 1.6 * prof[k + 1]:
+                    prof[k] = 1.6 * prof[k + 1]
+            self.in_area = prof
+            # filter element: linear loss in the box cells. Spec dp_f at
+            # peak flow -> drag coefficient c = dp_f/(L_f*u_face); momentum
+            # rate c/rho (1/s); per-substep with the duct's exact dt_gas.
+            dp_f = 1000.0                               # Pa, clean element
+            q_pk = Vd_total * cfg.redline_rpm / 60.0 / 2.0   # m^3/s, VE~1
+            u_face = max(q_pk / A_box, 0.5)
+            L_f = max(L_box, 0.05)
+            rho_a = PATM / (R_AIR * TATM)
+            alpha_f = dp_f / (L_f * u_face) / rho_a     # 1/s
+            nsub_i = int(500.0 * (1.0 / SAMPLE_RATE) / (0.8 * dx_in)) + 1
+            dt_g_i = (1.0 / SAMPLE_RATE) / nsub_i
+            self.pk_in[(xi >= 0.55) & (xi <= 0.80 + 2.0 * si)] = \
+                alpha_f * dt_g_i
         self.in_aface = self._faces(self.in_area)
         self.in_wk = np.zeros((15, nin))
         run_a = P[core.P_RUN_AREA] if P[core.P_RUN_AREA] > 0.0 else 1e-4
@@ -621,7 +665,6 @@ class EngineSim:
         self.bnd_ex = np.zeros((nbanks, 2))
         self.bnd_in = np.zeros(2)
         self.bnd_run = np.zeros((ncyl, 2))
-        self.pk_in = np.zeros(max(1, Ni))
         self.pk_run = np.zeros(self.Nr)
 
         self.scope_p = np.full(N_SCOPE, PATM)
